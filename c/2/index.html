@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 2: How LLMs Work - Inference Book Calculators</title>
+  <meta name="description" content="Interactive calculators for Chapter 2 - How LLMs Work">
+  <link rel="stylesheet" href="/iplane/static/css/calculator.css">
+  <style>
+    .calc-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    .calc-card {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 1.25rem;
+      text-decoration: none;
+      color: var(--text);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      transition: transform 0.15s, box-shadow 0.15s;
+      display: block;
+    }
+
+    .calc-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+
+    .calc-card h3 {
+      margin: 0 0 0.5rem 0;
+      color: var(--primary);
+      font-size: 1.1rem;
+    }
+
+    .calc-card p {
+      margin: 0;
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+
+    .calc-card .section {
+      display: inline-block;
+      background: var(--bg);
+      padding: 0.125rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      margin-top: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .chapter-section {
+      margin-top: 2rem;
+    }
+
+    .chapter-section h2 {
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    
+    <nav class="breadcrumb">
+      <a href="/iplane/">Calculators</a> &rsaquo;
+      Chapter 2
+    </nav>
+    
+
+    <header>
+      <h1>Chapter 2: How LLMs Work</h1>
+      
+    </header>
+
+    <main>
+      
+<p>These calculators turn the architecture dimensions in Chapter 2 into parameter counts, so you can see what a change to depth, width or FFN shape actually costs.</p>
+
+<div class="calc-grid">
+  <a href="/iplane/c/2/params/" class="calc-card">
+    <h3>Model Parameter Calculator</h3>
+    <p>Estimate total parameters from model architecture dimensions</p>
+    <span class="section">Section 2.5</span>
+  </a>
+
+  <a href="/iplane/c/2/ffn/" class="calc-card">
+    <h3>FFN Parameter Calculator</h3>
+    <p>Calculate feed-forward network parameters for standard and SwiGLU layers</p>
+    <span class="section">Section 2.4</span>
+  </a>
+</div>
+
+    </main>
+
+    <footer>
+      <p>From <em>Inference Is All You Need</em> by Sriram Panyam</p>
+    </footer>
+  </div>
+</body>
+</html>
