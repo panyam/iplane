@@ -1,0 +1,360 @@
+/* Inference Book - Interactive Calculators */
+:root {
+  --primary: #2563eb;
+  --primary-dark: #1d4ed8;
+  --bg: #f8fafc;
+  --card-bg: #ffffff;
+  --text: #1e293b;
+  --text-muted: #64748b;
+  --border: #e2e8f0;
+  --result-bg: #f0fdf4;
+  --result-border: #86efac;
+  --formula-bg: #fef3c7;
+  --input-focus: rgba(37, 99, 235, 0.1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  margin: 0;
+  padding: 20px;
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+/* Header */
+header {
+  margin-bottom: 1.5rem;
+}
+
+header h1 {
+  font-size: 1.5rem;
+  margin: 0 0 0.25rem 0;
+}
+
+header .chapter-ref {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+.breadcrumb {
+  font-size: 0.875rem;
+  margin-bottom: 1rem;
+}
+
+.breadcrumb a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.breadcrumb a:hover {
+  text-decoration: underline;
+}
+
+/* Card container */
+.card {
+  background: var(--card-bg);
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.card h2 {
+  font-size: 1.1rem;
+  margin: 0 0 1rem 0;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Two-column layout: Inputs left, Results right */
+.calculator-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.calculator-layout > .card {
+  margin-bottom: 0;
+}
+
+/* Two-column grid for input fields within Inputs card */
+.inputs-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 1.25rem;
+}
+
+/* Formula display */
+.formula-box {
+  background: var(--formula-bg);
+  border-radius: 8px;
+  padding: 1rem 1.5rem;
+  margin-bottom: 1.5rem;
+  text-align: center;
+}
+
+.formula-box .katex {
+  font-size: 1.25rem;
+}
+
+/* Input groups */
+.input-group {
+  margin-bottom: 1.25rem;
+}
+
+.input-group label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 0.375rem;
+  font-size: 0.9rem;
+}
+
+.input-group .hint {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+}
+
+.input-row {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.input-row .input-group {
+  flex: 1;
+  min-width: 140px;
+}
+
+/* Inputs */
+input[type="number"],
+select {
+  width: 100%;
+  padding: 0.625rem 0.875rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 1rem;
+  background: white;
+}
+
+input[type="number"]:focus,
+select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--input-focus);
+}
+
+/* Range slider */
+.range-container {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.range-container input[type="range"] {
+  flex: 1;
+}
+
+.range-value {
+  min-width: 60px;
+  text-align: right;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+/* Presets */
+.presets {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.presets label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 0.5rem;
+  width: 100%;
+  font-size: 0.9rem;
+}
+
+.preset-btn {
+  padding: 0.375rem 0.875rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card-bg);
+  cursor: pointer;
+  font-size: 0.875rem;
+  transition: all 0.15s;
+}
+
+.preset-btn:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.preset-btn.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: white;
+}
+
+/* Result box */
+.result-box {
+  background: var(--result-bg);
+  border: 2px solid var(--result-border);
+  border-radius: 10px;
+  padding: 1.25rem;
+  text-align: center;
+  margin-top: 1rem;
+}
+
+.result-box .label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.25rem;
+}
+
+.result-box .value {
+  font-size: 2.25rem;
+  font-weight: 700;
+  color: var(--primary-dark);
+}
+
+.result-box .unit {
+  font-size: 1rem;
+  color: var(--text-muted);
+  margin-left: 0.25rem;
+}
+
+/* Result grid for multiple outputs */
+.result-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.result-item {
+  background: var(--bg);
+  padding: 1rem;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.result-item .label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.result-item .value {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text);
+  margin-top: 0.25rem;
+}
+
+/* Breakdown table */
+.breakdown {
+  margin-top: 1rem;
+  font-size: 0.875rem;
+}
+
+.breakdown-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.breakdown-row:last-child {
+  border-bottom: none;
+  font-weight: 600;
+}
+
+/* Footer */
+footer {
+  text-align: center;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+footer a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+/* Share/Copy URL */
+.share-url {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.share-url button {
+  padding: 0.5rem 1rem;
+  background: var(--primary);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.875rem;
+}
+
+.share-url button:hover {
+  background: var(--primary-dark);
+}
+
+.share-url .url-display {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 0.5rem;
+  word-break: break-all;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+  .calculator-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  body {
+    padding: 12px;
+  }
+
+  .card {
+    padding: 1rem;
+  }
+
+  .result-box .value {
+    font-size: 1.75rem;
+  }
+
+  .input-row .input-group {
+    min-width: 100%;
+  }
+
+  .inputs-grid {
+    grid-template-columns: 1fr;
+  }
+}

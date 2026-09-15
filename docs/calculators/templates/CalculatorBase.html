@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{.FrontMatter.title}} - {{BookTitle}}</title>
+  <meta name="description" content="{{.FrontMatter.description}}">
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="{{.Site.PathRelUrl "/static/css/calculator.css"}}">
+
+  <!-- KaTeX for formula rendering -->
+  <link rel="stylesheet" href="{{.Site.PathRelUrl "/static/vendor/katex/katex.min.css"}}">
+  <script defer src="{{.Site.PathRelUrl "/static/vendor/katex/katex.min.js"}}"></script>
+</head>
+<body>
+  <div class="container">
+    <nav class="breadcrumb">
+      <a href="{{.Site.PathRelUrl "/"}}">Calculators</a> &rsaquo;
+      <a href="{{.Site.PathRelUrl (printf "/c/%v/" .FrontMatter.chapter)}}">Chapter {{.FrontMatter.chapter}}</a> &rsaquo;
+      {{.FrontMatter.title}}
+    </nav>
+
+    <header>
+      <h1>{{.FrontMatter.title}}</h1>
+      <p class="chapter-ref">Chapter {{.FrontMatter.chapter}}, Section {{.FrontMatter.section}}</p>
+    </header>
+
+    <main>
+      <div id="calculator" data-formula="{{.FrontMatter.formula_id}}"></div>
+    </main>
+
+    <footer>
+      <p>From <em>{{BookTitle}}</em> by Sriram Panyam</p>
+    </footer>
+  </div>
+
+  <!-- Calculator scripts -->
+  <script src="{{.Site.PathRelUrl "/static/js/formulas.js"}}"></script>
+  <script src="{{.Site.PathRelUrl "/static/js/calculator.js"}}"></script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+---
+title: "Chapter 3: Hardware Fundamentals"
+description: "Interactive calculators for Chapter 3 - Hardware Fundamentals"
+chapter: 3
+template: "CalculatorIndex.html"
+---
+
+<p>These calculators help you understand and estimate the hardware requirements for self-hosted inference.</p>
+
+<div class="calc-grid">
+  <a href="{{.Site.PathRelUrl "/c/3/vram/"}}" class="calc-card">
+    <h3>Weight Memory Calculator</h3>
+    <p>Calculate GPU memory required for model weights at different precisions</p>
+    <span class="section">Section 3.1</span>
+  </a>
+
+  <a href="{{.Site.PathRelUrl "/c/3/kv/"}}" class="calc-card">
+    <h3>KV Cache Calculator</h3>
+    <p>Calculate memory required for Key-Value cache during inference</p>
+    <span class="section">Section 3.1.2</span>
+  </a>
+
+  <a href="{{.Site.PathRelUrl "/c/3/total/"}}" class="calc-card">
+    <h3>Total VRAM Calculator</h3>
+    <p>Calculate total GPU memory including weights, KV cache, and overhead</p>
+    <span class="section">Section 3.2</span>
+  </a>
+
+  <a href="{{.Site.PathRelUrl "/c/3/breakeven/"}}" class="calc-card">
+    <h3>Break-Even Calculator</h3>
+    <p>Calculate when buying hardware becomes cheaper than renting</p>
+    <span class="section">Section 3.5.3</span>
+  </a>
+</div>

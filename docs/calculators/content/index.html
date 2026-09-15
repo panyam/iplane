@@ -1,0 +1,58 @@
+---
+title: "Calculators"
+subtitle: "Interactive tools for the book"
+description: "Interactive calculators for the formulas in the book"
+template: "CalculatorIndex.html"
+---
+
+<div class="chapter-section">
+  <h2>Chapter 2: How LLMs Work</h2>
+  <div class="calc-grid">
+    <a href="{{.Site.PathRelUrl "/c/2/params/"}}" class="calc-card">
+      <h3>Model Parameter Calculator</h3>
+      <p>Estimate total parameters from model architecture dimensions</p>
+      <span class="section">Section 2.5</span>
+    </a>
+
+    <a href="{{.Site.PathRelUrl "/c/2/ffn/"}}" class="calc-card">
+      <h3>FFN Parameters Calculator</h3>
+      <p>Calculate feed-forward network parameters per layer</p>
+      <span class="section">Section 2.4.3</span>
+    </a>
+
+    <a href="{{.Site.PathRelUrl "/c/3/kv/"}}" class="calc-card">
+      <h3>KV Cache Calculator</h3>
+      <p>Calculate memory required for Key-Value cache during inference</p>
+      <span class="section">Section 2.6 &amp; 3.1.2</span>
+    </a>
+  </div>
+</div>
+
+<div class="chapter-section">
+  <h2>Chapter 3: Hardware Fundamentals</h2>
+  <div class="calc-grid">
+    <a href="{{.Site.PathRelUrl "/c/3/vram/"}}" class="calc-card">
+      <h3>Weight Memory Calculator</h3>
+      <p>Calculate GPU memory required for model weights at different precisions</p>
+      <span class="section">Section 3.1</span>
+    </a>
+
+    <a href="{{.Site.PathRelUrl "/c/3/kv/"}}" class="calc-card">
+      <h3>KV Cache Calculator</h3>
+      <p>Calculate memory required for Key-Value cache during inference</p>
+      <span class="section">Section 3.1.2</span>
+    </a>
+
+    <a href="{{.Site.PathRelUrl "/c/3/total/"}}" class="calc-card">
+      <h3>Total VRAM Calculator</h3>
+      <p>Calculate total GPU memory including weights, KV cache, and overhead</p>
+      <span class="section">Section 3.2</span>
+    </a>
+
+    <a href="{{.Site.PathRelUrl "/c/3/breakeven/"}}" class="calc-card">
+      <h3>Break-Even Calculator</h3>
+      <p>Calculate when buying hardware becomes cheaper than renting</p>
+      <span class="section">Section 3.5.3</span>
+    </a>
+  </div>
+</div>
