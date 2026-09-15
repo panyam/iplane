@@ -67,3 +67,9 @@ capacity-samples.jsonl
 # Paid measurement-run artifacts (hack/measure-run.sh). The distilled
 # csv is what gets committed, not the raw run directory.
 measure-runs/
+
+# Built calculator site; regenerate with 'make export-pages' in docs/calculators
+docs/calculators/output/
+
+# Per-machine Claude Code settings
+.claude/settings.local.json

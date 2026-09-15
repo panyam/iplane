@@ -1,0 +1,22 @@
+---
+title: "Chapter 2: How LLMs Work"
+description: "Interactive calculators for Chapter 2 - How LLMs Work"
+chapter: 2
+template: "CalculatorIndex.html"
+---
+
+<p>These calculators turn the architecture dimensions in Chapter 2 into parameter counts, so you can see what a change to depth, width or FFN shape actually costs.</p>
+
+<div class="calc-grid">
+  <a href="{{.Site.PathRelUrl "/c/2/params/"}}" class="calc-card">
+    <h3>Model Parameter Calculator</h3>
+    <p>Estimate total parameters from model architecture dimensions</p>
+    <span class="section">Section 2.5</span>
+  </a>
+
+  <a href="{{.Site.PathRelUrl "/c/2/ffn/"}}" class="calc-card">
+    <h3>FFN Parameter Calculator</h3>
+    <p>Calculate feed-forward network parameters for standard and SwiGLU layers</p>
+    <span class="section">Section 2.4</span>
+  </a>
+</div>
