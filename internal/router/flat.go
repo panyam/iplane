@@ -100,7 +100,8 @@ func (r *Router) serveFlat(w http.ResponseWriter, req *http.Request) {
 // request for `model`. Policy (v0.2 ch7-beat1.3b):
 //
 //   - filter ListDeployments by Deployment.model == requested
-//   - prefer RUNNING over other states
+//   - prefer RUNNING, then DEGRADED (serving on its healthy
+//     replicas), then everything else
 //   - among matches at equal precedence, prefer the most recently
 //     created (newest first)
 //
@@ -125,17 +126,30 @@ func (r *Router) pickDeploymentForModel(ctx context.Context, model string) (*pro
 		return nil, errModelNotFound{model: model}
 	}
 	sort.SliceStable(matches, func(i, j int) bool {
-		// RUNNING ahead of everything else; within RUNNING, newest first.
-		ri := matches[i].GetState() == provisionerv1.DeploymentState_DEPLOYMENT_STATE_RUNNING
-		rj := matches[j].GetState() == provisionerv1.DeploymentState_DEPLOYMENT_STATE_RUNNING
+		// RUNNING, then DEGRADED, then the rest; newest first within a rank.
+		ri, rj := servingRank(matches[i].GetState()), servingRank(matches[j].GetState())
 		if ri != rj {
-			return ri
+			return ri < rj
 		}
 		ti := matches[i].GetCreatedAt().AsTime()
 		tj := matches[j].GetCreatedAt().AsTime()
 		return ti.After(tj)
 	})
 	return matches[0], nil
+}
+
+// servingRank orders deployment states for pickDeploymentForModel:
+// RUNNING serves on every replica, DEGRADED on the healthy ones, and
+// anything else is not serving yet (or any more).
+func servingRank(s provisionerv1.DeploymentState) int {
+	switch s {
+	case provisionerv1.DeploymentState_DEPLOYMENT_STATE_RUNNING:
+		return 0
+	case provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED:
+		return 1
+	default:
+		return 2
+	}
 }
 
 // errModelNotFound is the sentinel pickDeploymentForModel returns when
