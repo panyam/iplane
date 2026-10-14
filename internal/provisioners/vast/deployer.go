@@ -41,7 +41,8 @@ import (
 // Two consequences. Vast owns pid 1 and **never runs the image's
 // entrypoint**, so the deployment must supply the whole engine command
 // rather than only its arguments; that is what Deployment.engine_entrypoint
-// is for, and on this provider it is required rather than optional. And
+// is for. For a vllm/vllm-openai image EngineCommand fills it in; for any
+// other image it is required, and the deploy refuses before renting. And
 // sshd keeps running alongside, so `iplane instance ssh` still works for
 // debugging even though nothing in the deploy path uses it.
 func (p *Provider) Deploy(ctx context.Context, dep *provisionerv1.Deployment, inst *provisionerv1.Instance, _ *sshkeys.KeyPair, emit func(provisioners.DeployStateUpdate)) error {
@@ -51,12 +52,9 @@ func (p *Provider) Deploy(ctx context.Context, dep *provisionerv1.Deployment, in
 	if dep.GetImage() == "" {
 		return deployFailed(emit, "validate", fmt.Errorf("deployment.image is required for the image-as-container model"))
 	}
-	engineCmd := dep.GetEngineEntrypoint()
-	if len(engineCmd) == 0 {
-		return deployFailed(emit, "validate", fmt.Errorf(
-			"deployment.engine_entrypoint is required on vast: the provider replaces the image's "+
-				"entrypoint with its own launcher, so the engine's start command has to be supplied "+
-				"(e.g. --engine-entrypoint python3 --engine-entrypoint=-m --engine-entrypoint vllm.entrypoints.openai.api_server)"))
+	engineCmd, err := EngineCommand(dep.GetImage(), dep.GetEngineEntrypoint())
+	if err != nil {
+		return deployFailed(emit, "validate", err)
 	}
 
 	enginePort := dep.GetEnginePort()

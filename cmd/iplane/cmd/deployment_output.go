@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
 	"github.com/inference-book/inference-plane/internal/provisioners"
+	"github.com/inference-book/inference-plane/internal/provisioners/vast"
 	"github.com/inference-book/inference-plane/internal/vrambudget"
 )
 
@@ -207,7 +209,17 @@ func dryRunDeploy(ctx context.Context, w io.Writer, client deploymentClient, dep
 	fmt.Fprintf(w, "[dry-run]   model:       %s\n", dep.GetModel())
 	fmt.Fprintf(w, "[dry-run]   engine port: %d\n", dep.GetEnginePort())
 	if len(dep.GetEngineArgs()) > 0 {
-		fmt.Fprintf(w, "[dry-run]   engine args: %v\n", dep.GetEngineArgs())
+		fmt.Fprintf(w, "[dry-run]   engine args: %q\n", dep.GetEngineArgs())
+	}
+	// Vast never runs the image's entrypoint, so the command it will exec
+	// is worth showing, and an image nothing knows how to start is refused
+	// here rather than after the meter starts.
+	if deployProvider == provisioners.ProviderVast && deployInstanceID == "" {
+		if engineCmd, err := vast.EngineCommand(dep.GetImage(), dep.GetEngineEntrypoint()); err != nil {
+			fmt.Fprintf(w, "[dry-run]   entrypoint:  WOULD BE REFUSED: %v\n", err)
+		} else {
+			fmt.Fprintf(w, "[dry-run]   entrypoint:  %s (vast runs this in place of the image's own)\n", strings.Join(engineCmd, " "))
+		}
 	}
 	// The plan the pre-flight will size against, read back out of those
 	// args. Printed because the parsing is otherwise invisible: an

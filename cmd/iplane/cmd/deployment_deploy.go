@@ -333,7 +333,7 @@ func init() {
 	f.StringToStringVar(&deployEnv, "env", nil,
 		`env var to set in the engine container, KEY=VALUE (repeatable)`)
 	f.StringSliceVar(&deployEngineEntrypnt, "engine-entrypoint", nil,
-		`command that starts the engine inside the image, e.g. "vllm,serve". Normally unnecessary: iplane replaces the image CMD and lets the image ENTRYPOINT supply the binary. Set it only to run the registration agent alongside the engine on an image-native provider, where the wrapper has to exec the engine itself. There is no safe default to infer (vllm/vllm-openai changed entrypoints between releases), so leaving it unset simply means no agent and liveness stays with the /health poller.`)
+		`command that starts the engine inside the image, one argument per flag (e.g. --engine-entrypoint python3 --engine-entrypoint=-m --engine-entrypoint vllm.entrypoints.openai.api_server). On RunPod it is normally unnecessary: iplane replaces the image CMD and lets the image ENTRYPOINT supply the binary, so set it only to run the registration agent alongside the engine. Vast never runs the image's entrypoint, so there it defaults to python3 -m vllm.entrypoints.openai.api_server for a vllm/vllm-openai image and is required for any other`)
 	f.StringVar(&deployOtelEndpoint, "otel-endpoint", os.Getenv("IPLANE_OTEL_ENDPOINT"),
 		`OTLP endpoint URL for the engine to ship traces/metrics to (default: IPLANE_OTEL_ENDPOINT env). Sets OTEL_EXPORTER_OTLP_ENDPOINT on the pod. Examples: Grafana Cloud Free's OTLP HTTP URL, or 'iplane telemetry url' for a cloudflared tunnel to the local stack.`)
 	f.StringToStringVar(&deployOtelHeaders, "otel-headers", parseOtelHeadersEnv(os.Getenv("IPLANE_OTEL_HEADERS")),
