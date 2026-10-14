@@ -47,10 +47,12 @@ func collect() (func(provisioners.DeployStateUpdate), *[]provisioners.DeployStat
 // Vast replaces the image's entrypoint with its own launcher, so an image
 // that would have started itself on RunPod starts nothing here. Failing
 // early with a message naming the flag beats renting a machine that runs
-// sshd and nothing else.
+// sshd and nothing else. The vLLM image is the exception (see the next
+// test), so this uses one iplane has no start command for.
 func TestDeployRequiresAnEngineEntrypoint(t *testing.T) {
 	p, _ := newTestProvider(t, http.NotFoundHandler())
 	dep := engineDep()
+	dep.Image = "ghcr.io/huggingface/text-generation-inference:3"
 	dep.EngineEntrypoint = nil
 	emit, updates := collect()
 
@@ -64,6 +66,37 @@ func TestDeployRequiresAnEngineEntrypoint(t *testing.T) {
 	}
 	if len(*updates) == 0 || (*updates)[len(*updates)-1].State != provisionerv1.DeploymentState_DEPLOYMENT_STATE_FAILED {
 		t.Error("failure was not emitted as a terminal state")
+	}
+}
+
+// The book's deploy commands name no entrypoint, and on the vLLM image they
+// do not have to: the rent goes out with the API server as the onstart
+// command rather than being refused.
+func TestDeployDefaultsTheEntrypointForTheVLLMImage(t *testing.T) {
+	var onstart string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v0/bundles/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"offers":[{"id":42,"gpu_name":"RTX_3060","num_gpus":1,"disk_space":200,"dph_total":1.0,"machine_id":7}]}`))
+	})
+	mux.HandleFunc("/api/v0/asks/42/", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		onstart, _ = body["onstart"].(string)
+		_, _ = w.Write([]byte(`{"success":true,"new_contract":99}`))
+	})
+	mux.HandleFunc("/api/v0/instances/99/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"instances":{"id":99,"cur_state":"stopped","status_msg":"error pulling image configuration"}}`))
+	})
+	p, _ := newTestProvider(t, mux)
+	dep := engineDep()
+	dep.Image = "vllm/vllm-openai:v0.27.1"
+	dep.EngineEntrypoint = nil
+	emit, _ := collect()
+
+	_ = p.Deploy(t.Context(), dep, engineInst(), nil, emit)
+
+	if !strings.Contains(onstart, `exec 'python3' '-m' 'vllm.entrypoints.openai.api_server' '--model'`) {
+		t.Errorf("onstart = %q, want the vLLM API server as the engine command", onstart)
 	}
 }
 
@@ -223,6 +256,11 @@ func TestWaitForEngineReadyTimesOutWithAReason(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "public address") && !strings.Contains(err.Error(), "did not answer") {
 		t.Errorf("error = %v, want it to say what it was waiting for", err)
+	}
+	// The deadline is the daemon's, so the message has to name the setting
+	// that moves it rather than leave the operator raising --timeout.
+	if !strings.Contains(err.Error(), "IPLANE_ENGINE_READY_TIMEOUT") {
+		t.Errorf("error = %v, want it to name IPLANE_ENGINE_READY_TIMEOUT", err)
 	}
 }
 
