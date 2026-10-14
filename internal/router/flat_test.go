@@ -89,7 +89,10 @@ func TestRouter_Flat_MissingModel_400(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[]}`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
@@ -105,7 +108,10 @@ func TestRouter_Flat_MalformedJSON_400(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{not json`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{not json`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
@@ -122,7 +128,10 @@ func TestRouter_Flat_ModelNotFound_404(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"absent/model","messages":[]}`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"absent/model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
@@ -172,7 +181,10 @@ func TestRouter_Flat_MultipleMatches_PicksNewestRunning(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -195,7 +207,10 @@ func TestRouter_Flat_AllMatchesNotRunning_503ish(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
