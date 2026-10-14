@@ -273,6 +273,14 @@ func dryRunDeploy(ctx context.Context, w io.Writer, client deploymentClient, dep
 			plan.Weights, cacheLabel(plan), plan.MaxModelLen, plan.MaxBatch, max(plan.TPSize, 1))
 		fmt.Fprintf(w, "[dry-run]   size it with: iplane model budget %s --quantization %s --max-model-len %d --max-batch %d --vram-gb <card>\n",
 			dep.GetModel(), plan.Weights, plan.MaxModelLen, plan.MaxBatch)
+		// The two other reasons the daemon steps aside. The SKU is visible
+		// from here; whether the checkpoint is published pre-quantized needs
+		// the hub, so it is named rather than checked.
+		if deploySKU == "" && deployInstanceID == "" {
+			fmt.Fprintln(w, "[dry-run]   pre-flight:  will not run: it needs an exact --sku to know what one card holds (--min-vram-gb is a floor, not a capacity)")
+		} else {
+			fmt.Fprintln(w, "[dry-run]   pre-flight:  runs before renting, unless the checkpoint is published pre-quantized (AWQ, GPTQ, FP8, compressed-tensors), which it cannot size; the daemon logs a warning when it steps aside")
+		}
 	} else {
 		fmt.Fprintln(w, "[dry-run]   plan read:   no context length in the engine args, so the VRAM pre-flight will not run")
 	}
