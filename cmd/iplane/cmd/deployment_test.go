@@ -398,6 +398,46 @@ func TestDeploy_DryRun_FreshID(t *testing.T) {
 	}
 }
 
+// Vast execs a command of iplane's choosing instead of the image's
+// entrypoint, so the preview says which, and refuses an image it cannot
+// start before anything is rented.
+func TestDeploy_DryRun_ShowsTheVastEntrypoint(t *testing.T) {
+	env := newDeploymentTestEnv(t)
+	out, err := runDeploymentCmd(t, env,
+		"deploy", "big",
+		"--provider", "vast", "--sku", "H100_SXM", "--gpu-count", "2",
+		"--model", "Qwen/Qwen2.5-72B-Instruct",
+		"--engine-args", "--max-model-len 16384 --max-num-seqs 16",
+		"--dry-run",
+	)
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"entrypoint:  python3 -m vllm.entrypoints.openai.api_server",
+		`"--max-model-len" "16384" "--max-num-seqs" "16"`,
+		defaultEngineImage,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry-run output missing %q; got:\n%s", want, out)
+		}
+	}
+
+	out, err = runDeploymentCmd(t, env,
+		"deploy", "tgi",
+		"--provider", "vast", "--sku", "H100_SXM",
+		"--image", "ghcr.io/huggingface/text-generation-inference:3",
+		"--model", "Qwen/Qwen2.5-72B-Instruct",
+		"--dry-run",
+	)
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "entrypoint:  WOULD BE REFUSED") {
+		t.Errorf("dry-run should refuse an image vast cannot start; got:\n%s", out)
+	}
+}
+
 func TestDeploy_DryRun_IdempotentPath(t *testing.T) {
 	env := newDeploymentTestEnv(t)
 	if _, err := runDeploymentCmd(t, env,
