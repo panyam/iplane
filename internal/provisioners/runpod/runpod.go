@@ -1,37 +1,28 @@
 // Package runpod implements the Provider interface against RunPod's
-// REST API (https://rest.runpod.io/v1). The adapter speaks five
-// endpoints: POST /pods (create), GET /pods/{id} (describe), GET /pods
-// (list with server-side filtering), DELETE /pods/{id} (terminate),
-// and a follow-up GET /pods/{id} after every POST /pods to fetch the
-// full pod record (POST returns only {id, desiredStatus, status}).
+// REST API v2 (https://api.runpod.io/v2). Pods are created with
+// POST /pods, read with GET /pods/{id}, listed with GET /pods (cursor
+// paginated, filtered client-side) and terminated with DELETE /pods/{id}.
+// The create response is the full pod record, so no follow-up read is
+// needed to learn its price or placement.
 //
-// Why REST and not GraphQL. RunPod has both, but the REST API is the
-// pattern every other provider iplane will ship against (Lambda Labs
-// in v0.2, Vast.ai / AWS / GCP in v0.3). Keeping all adapters on one
-// transport means shared HTTP scaffolding, shared error mapping,
-// shared OTel instrumentation later. The book also benefits: act-2's
-// manual path is a one-line curl, not a GraphQL query string.
+// One GPU type per create. v2's create places exactly one GPU type in one
+// cloud and never falls back, where v1 took a list of gpuTypeIds and let
+// RunPod pick. The adapter keeps the old behaviour by walking the
+// cheapest-first SKU list itself, moving on when RunPod answers 400 (no
+// capacity for this combination) or 403 (account cannot use this pool),
+// and stopping on anything else. That is the read-then-create loop
+// RunPod's own documentation for POST /v2/pods prescribes.
 //
-// Tag stamping in v0.1. RunPod's REST create body has no env field,
-// so the adapter encodes iplane-id in the pod name (prefix "iplane-")
-// and that is the only iplane tag visible on the pod itself. Server-side
-// filtering by iplane-id works via the ?name= query param. The
-// iplane-operator tag lives only in the iplane state file in v0.1 --
-// good enough because v0.1 is single-operator. Multi-operator state
-// (v1.0) revisits this with templates or a post-create update call.
-//
-// Base image and deploy split. v0.1's design (see
-// docs/design/0001-provisioner.md "Provisioner / deploy split on
-// RunPod") says phase 1 provisions a Docker-capable base image and
-// phase 2's deploy primitive docker-runs the engine container on top.
-// Default base is RunPod's PyTorch image; operator overrides via
-// Spec.base_image.
+// Tag stamping. The create body has no tag field, so the adapter encodes
+// iplane-id in the pod name (prefix "iplane-") and that is the only
+// iplane tag visible on the pod itself. v2 has no name filter on
+// GET /pods, so List reads every page and matches client-side. The
+// iplane-operator tag lives only in the iplane state file.
 //
 // SSH readiness. Spawn returns State=ACTIVE as soon as RunPod
-// acknowledges the pod and we have its full record, but the SSH
-// endpoint may take another 20-60s to become reachable. ssh fields
-// stay empty in the Spawn response unless RunPod has already assigned
-// an IP. Phase 2's deploy primitive polls Describe before docker-run.
+// acknowledges the pod, but the SSH endpoint may take another 20-60s to
+// become reachable. ssh fields stay empty in the Spawn response unless
+// RunPod has already published a direct SSH endpoint.
 package runpod
 
 import (
@@ -49,58 +40,57 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Defaults for fields that v0.1 does not expose on Spec. Phase 1.4's
-// CLI may eventually expose some of these (--container-disk, etc.);
-// for now they are hardcoded.
+// Defaults for fields that v0.1 does not expose on Spec.
 //
-// cloudType is deliberately unset. RunPod's two cloud types are SECURE
-// (T1/T2 datacenters; A100s, H100s, datacenter cards) and COMMUNITY
-// (T3/T4 community hosts; cheap consumer cards like RTX 4090 and
-// A5000). Pinning either side silently filters out half the catalog --
-// an operator who asked for class=small under SECURE gets a "no pods
-// available" because the cheap SKUs live in COMMUNITY. Leaving
-// cloudType empty lets RunPod schedule on whichever has capacity for
-// the requested gpuTypeIds.
+// Cloud tier. RunPod's two clouds are SECURE (T1/T2 datacenters; A100s,
+// H100s, datacenter cards) and COMMUNITY (T3/T4 community hosts; cheap
+// consumer cards like RTX 4090 and A5000). v1 left cloudType unset on the
+// create; v2 defaults it to SECURE and, like the GPU type, takes exactly
+// one per create. So the adapter tries the clouds in order itself, the
+// same way it walks the SKU list (see createPod).
 //
-// publicIp + cost interaction: SECURE pods get publicIp by default;
-// COMMUNITY pods do NOT (the cheaper tier). publicIp is a billed
-// resource on RunPod (~$0.01-0.03/hr) and demanding it restricts us
-// to publicIp-capable hosts -- so allocating one we don't need leaves
-// money on the table.
+// Which clouds a create may use depends on whether it needs SSH. v1 had a
+// supportPublicIp flag that restricted placement to hosts with a routable
+// IP; v2 has no such flag. SECURE pods get a public IP by default and
+// COMMUNITY pods may not, so a pod that has to be SSH-reachable (Spawn,
+// and a deploy with debug_shell) stays on SECURE, and only the proxy-only
+// engine deploy also tries COMMUNITY.
 //
 // Cost-aware default: the Deployer ships the engine port as /http
-// (proxied at <pod-id>-<port>.proxy.runpod.net) and DOES NOT request
-// supportPublicIp. The proxy URL is free, deterministic, and works
-// regardless of which cloud RunPod scheduled onto. Health probes hit
-// the proxy URL directly; no Stage-1 publicIp wait, no NAT lookup.
+// (proxied at <pod-id>-<port>.proxy.runpod.net) and does not expose
+// 22/tcp. The proxy URL is free, deterministic, and works regardless of
+// which cloud RunPod scheduled onto. Health probes hit the proxy URL
+// directly; no public IP wait, no NAT lookup.
 //
-// Opt-in: Deployment.debug_shell=true (CLI: --debug-shell) flips the
-// deploy to declare 22/tcp + supportPublicIp=true. The operator pays
-// for the routable IP and the placement penalty in exchange for
-// shell access to the running engine pod (`iplane instance ssh`).
+// Opt-in: Deployment.debug_shell=true (CLI: --debug-shell) adds 22/tcp
+// and startSsh, and keeps the pod on SECURE. The operator gets shell
+// access to the running engine pod (`iplane instance ssh`) in exchange
+// for the narrower placement.
 //
-// Spawn (iplane instance create) does set supportPublicIp=true: that
-// path's purpose is provisioning an SSH-able VM-style instance, so
-// no publicIp = no usable instance.
-//
-// gpuTypePriority=availability (defaultGPUPriority below) tells
-// RunPod "land on any matching SKU on any host with capacity" --
-// which makes community placements more likely. Without the proxy
-// default, this would compound the publicIp variance; with the
-// proxy default, it's just "find the cheapest free GPU."
+// Spawn (iplane instance create) always asks for SSH: that path's
+// purpose is provisioning an SSH-able VM-style instance, so no
+// reachable sshd means no usable instance.
 const (
 	defaultBaseImage       = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 	defaultContainerDiskGB = 20
-	defaultVolumeGB        = 0
-	defaultComputeType     = "GPU"
-	defaultGPUPriority     = "availability" // try SKUs in availability order; "custom" for strict priority
+	defaultVolumeMountPath = "/workspace" // where a network volume lands when the mount names no path
 	podNamePrefix          = "iplane-"
+
+	cloudSecure    = "SECURE"
+	cloudCommunity = "COMMUNITY"
 )
 
 // Default ports list. SSH (22/tcp) for phase 2's deploy primitive to
 // docker-run on top; HTTP (8000/http) for vLLM's OpenAI-compat server
 // once the engine container is running.
 var defaultPortsList = []string{"22/tcp", "8000/http"}
+
+// Cloud orders for createPod. sshClouds is for a pod that must be
+// SSH-reachable; anyCloud is for the proxy-only engine pod.
+var (
+	sshClouds = []string{cloudSecure}
+	anyCloud  = []string{cloudSecure, cloudCommunity}
+)
 
 // Provider implements provisioners.Provider for RunPod.
 type Provider struct {
@@ -235,10 +225,9 @@ func (p *Provider) IsActiveProviderState(state string) bool {
 	return isActiveProviderState(state)
 }
 
-// Spawn issues POST /pods, then immediately follows up with
-// GET /pods/{id} to fetch the full pod record (POST returns only
-// {id, desiredStatus, status}; we need costPerHr, createdAt, machine
-// info, ipAddress to populate the iplane Instance).
+// Spawn issues POST /pods, trying each SKU the requirements resolve to
+// until RunPod places one. The 201 carries the full pod record (price,
+// placement, GPU), so there is no follow-up read.
 func (p *Provider) Spawn(ctx context.Context, spec *provisionerv1.Spec) (*provisionerv1.Instance, error) {
 	if spec == nil {
 		return nil, provisioners.NewProviderError(p.Name(), "spawn", fmt.Errorf("spec is nil"), 0)
@@ -258,24 +247,14 @@ func (p *Provider) Spawn(ctx context.Context, spec *provisionerv1.Spec) (*provis
 			fmt.Errorf("requirements is required"), 0)
 	}
 	var gpuTypeIDs []string
-	resolvedSKU := reqs.GetSku()
-	resolvedClass := reqs.GetClass()
-	switch {
-	case resolvedSKU != "":
-		gpuTypeIDs = []string{resolvedSKU}
-		if resolvedClass == "" {
-			resolvedClass = classifySKU(resolvedSKU)
-		}
-	default:
+	if sku := reqs.GetSku(); sku != "" {
+		gpuTypeIDs = []string{sku}
+	} else {
 		gpuTypeIDs = MatchSKUs(reqs)
 		if len(gpuTypeIDs) == 0 {
 			return nil, provisioners.NewProviderError(p.Name(), "spawn",
 				fmt.Errorf("no SKU in the runpod catalog satisfies min_vram_gb=%d min_ram_gb=%d (try a different class or a lower constraint)",
 					reqs.GetMinVramGb(), reqs.GetMinRamGb()), 0)
-		}
-		resolvedSKU = gpuTypeIDs[0]
-		if resolvedClass == "" {
-			resolvedClass = classifySKU(resolvedSKU)
 		}
 	}
 	gpuCount := int(reqs.GetGpuCount())
@@ -288,18 +267,18 @@ func (p *Provider) Spawn(ctx context.Context, spec *provisionerv1.Spec) (*provis
 		image = defaultBaseImage
 	}
 
-	// Disk is per-instance in our model; RunPod's containerDiskInGb is
-	// also per-instance, so direct mapping. Use the operator's
-	// min_disk_gb if larger than our default.
+	// Disk is per-instance in our model; RunPod's container disk is also
+	// per-instance, so direct mapping. Use the operator's min_disk_gb if
+	// larger than our default.
 	containerDisk := defaultContainerDiskGB
 	if d := int(reqs.GetMinDiskGb()); d > containerDisk {
 		containerDisk = d
 	}
 
-	// System RAM is per-instance in our model; RunPod's minRAMPerGPU is
+	// System RAM is per-instance in our model; RunPod's minRamPerGpu is
 	// per-GPU. Convert at the wire boundary: total/N (with a ceiling to
 	// round up so we never under-request -- "I asked for 65 GB total on
-	// a 2-GPU pod" should send minRAMPerGPU=33, not 32).
+	// a 2-GPU pod" should send minRamPerGpu=33, not 32).
 	minRAMPerGPU := 0
 	if r := int(reqs.GetMinRamGb()); r > 0 {
 		minRAMPerGPU = (r + gpuCount - 1) / gpuCount
@@ -317,67 +296,190 @@ func (p *Provider) Spawn(ctx context.Context, spec *provisionerv1.Spec) (*provis
 	}
 
 	createBody := createPodRequest{
-		Name:              podNamePrefix + spec.GetId(),
-		ImageName:         image,
-		GPUTypeIDs:        gpuTypeIDs,
-		GPUTypePriority:   defaultGPUPriority,
-		GPUCount:          gpuCount,
-		MinRAMPerGPU:      minRAMPerGPU,
-		ComputeType:       defaultComputeType,
-		ContainerDiskInGB: containerDisk,
-		VolumeInGB:        defaultVolumeGB,
-		Ports:             defaultPortsList,
-		DataCenterIDs:     dataCenterIDs,
-		// Force publicIp allocation. See the cloudType comment block
-		// above for why this is required when cloudType is unpinned.
-		SupportPublicIP: true,
+		Name:          podNamePrefix + spec.GetId(),
+		Image:         image,
+		GPU:           &createGPU{Count: gpuCount, MinRAMPerGPU: minRAMPerGPU},
+		Disk:          containerDisk,
+		Ports:         defaultPortsList,
+		DataCenterIDs: dataCenterIDs,
+		// The account's registered keys reach the pod only when the
+		// create asks for them. v1 injected them unconditionally.
+		StartSSH: true,
 	}
 
-	req, err := p.client.newReq("POST", "/pods", nil, createBody)
+	pod, placed, err := p.createPod(ctx, "spawn", createBody, gpuPlacements(gpuTypeIDs, sshClouds))
 	if err != nil {
-		return nil, provisioners.NewProviderError(p.Name(), "spawn", err, 0)
-	}
-	created, err := skhttp.Call[createPodResponse](ctx, req, p.client.callOpts()...)
-	if err != nil {
-		return nil, wrapErr("spawn", err)
-	}
-	if created.ID == "" {
-		return nil, provisioners.NewProviderError(p.Name(), "spawn",
-			fmt.Errorf("runpod returned empty pod id (likely no capacity in %q for gpu %q)", spec.GetRegion(), resolvedSKU), 0)
+		return nil, err
 	}
 
-	// Follow-up GET to fetch the full record. We use the freshly-returned
-	// pod id, so a 404 here is genuinely surprising; surface as-is.
-	getReq, err := p.client.newReq("GET", "/pods/"+created.ID, nil, nil)
-	if err != nil {
-		return p.instanceFromCreate(spec, &created, resolvedClass, resolvedSKU, gpuCount), nil
+	resolvedSKU := pod.gpuSKU()
+	if resolvedSKU == "" {
+		resolvedSKU = placed.gpuID
 	}
-	pod, err := skhttp.Call[podBody](ctx, getReq, p.client.callOpts()...)
-	if err != nil {
-		// Spawn succeeded but follow-up failed. The pod exists; return a
-		// best-effort Instance from what we know so the Service can
-		// record it in state. Later Describe / List will fill the gaps.
-		return p.instanceFromCreate(spec, &created, resolvedClass, resolvedSKU, gpuCount), nil
+	resolvedClass := reqs.GetClass()
+	if resolvedClass == "" {
+		resolvedClass = classifySKU(resolvedSKU)
 	}
 
-	// Note: pod.publicIp is usually empty here -- RunPod assigns the
-	// public IP a few seconds after the pod is scheduled, after this
-	// immediate follow-up GET returns. Callers that need the SSH
-	// endpoint populated (e.g. before deploying onto the pod) drive
-	// the wait explicitly via WaitForSSHReady; Spawn returns ACTIVE
-	// fast so callers that don't need SSH (e.g. operators who just
-	// want a billed pod for an interactive jupyter / vscode session)
-	// don't pay for it.
+	// Note: the direct SSH endpoint is usually absent here -- RunPod
+	// publishes it once the running pod has a public port for 22/tcp.
+	// Callers that need the SSH endpoint populated (e.g. before deploying
+	// onto the pod) drive the wait explicitly via WaitForSSHReady; Spawn
+	// returns ACTIVE fast so callers that don't need SSH (e.g. operators
+	// who just want a billed pod for an interactive jupyter / vscode
+	// session) don't pay for it.
 	return p.podToInstance(&pod, spec, resolvedClass, resolvedSKU, gpuCount), nil
 }
 
+// podPlacement is one (GPU type or CPU flavor, cloud) combination a
+// create can try. Exactly one of gpuID and cpuID is set.
+type podPlacement struct {
+	gpuID string
+	cpuID string
+	cloud string
+}
+
+func (pl podPlacement) String() string {
+	id := pl.gpuID
+	if id == "" {
+		id = pl.cpuID
+	}
+	if pl.cloud == "" {
+		return id
+	}
+	return id + "/" + pl.cloud
+}
+
+// gpuPlacements expands a cheapest-first SKU list into the order createPod
+// tries them: each SKU on every allowed cloud before the next SKU, so a
+// cheaper card on the second cloud still beats a dearer one on the first.
+func gpuPlacements(skus, clouds []string) []podPlacement {
+	out := make([]podPlacement, 0, len(skus)*len(clouds))
+	for _, sku := range skus {
+		for _, cloud := range clouds {
+			out = append(out, podPlacement{gpuID: sku, cloud: cloud})
+		}
+	}
+	return out
+}
+
+// createPod issues POST /pods once per placement until one is accepted,
+// returning the pod and the placement that took.
+//
+// v2's create places exactly one GPU type (or CPU flavor) in one cloud
+// and does not fall back, so the fallback v1 did server-side from a list
+// of gpuTypeIds now happens here. Which failures move on follows RunPod's
+// own guidance for POST /v2/pods:
+//
+//   - 400: either this combination could not be placed (no capacity) or
+//     the body broke a cross-field rule. The two share a status and
+//     differ only in the human-readable detail, so try the next one; a
+//     rule violation fails identically everywhere and surfaces as the
+//     last error.
+//   - 403: the account cannot use this pool (B200, H200 and H100 NVL
+//     typically need approval). Skip it. Under v1 one restricted SKU in
+//     gpuTypeIds failed the whole request.
+//   - anything else (401, 402 insufficient balance, 422 malformed body,
+//     429, 5xx, transport): stop. No other candidate will do better, and
+//     retrying a 5xx is the caller's decision, not a reason to rent a
+//     different card.
+func (p *Provider) createPod(ctx context.Context, op string, base createPodRequest, tries []podPlacement) (podBody, podPlacement, error) {
+	if len(tries) == 0 {
+		return podBody{}, podPlacement{}, provisioners.NewProviderError(p.Name(), op, fmt.Errorf("no placement to try"), 0)
+	}
+	var lastErr error
+	var tried []string
+	for _, pl := range tries {
+		body := base
+		body.Cloud = pl.cloud
+		if pl.gpuID != "" {
+			g := createGPU{}
+			if base.GPU != nil {
+				g = *base.GPU
+			}
+			g.ID = pl.gpuID
+			body.GPU = &g
+		}
+		if pl.cpuID != "" {
+			c := createCPU{}
+			if base.CPU != nil {
+				c = *base.CPU
+			}
+			c.ID = pl.cpuID
+			body.CPU = &c
+		}
+
+		req, err := p.client.newReq("POST", "/pods", nil, body)
+		if err != nil {
+			return podBody{}, pl, provisioners.NewProviderError(p.Name(), op, err, 0)
+		}
+		pod, err := skhttp.Call[podBody](ctx, req, p.client.callOpts()...)
+		if err == nil {
+			if pod.ID == "" {
+				return podBody{}, pl, provisioners.NewProviderError(p.Name(), op,
+					fmt.Errorf("runpod accepted the create but returned an empty pod id (placement %s)", pl), 0)
+			}
+			return pod, pl, nil
+		}
+		lastErr = wrapErr(op, err)
+		tried = append(tried, pl.String())
+		if status := httpStatus(err); status != 400 && status != 403 {
+			return podBody{}, pl, lastErr
+		}
+	}
+	last := tries[len(tries)-1]
+	if len(tried) == 1 {
+		return podBody{}, last, lastErr
+	}
+	// Every candidate refused. Keep the last refusal as the cause so its
+	// detail (the only place RunPod says why) reaches the operator, and its
+	// status so callers can still classify it.
+	return podBody{}, last, provisioners.NewProviderError(p.Name(), op,
+		fmt.Errorf("no capacity for any of %d placements [%s]; last refusal: %w",
+			len(tried), strings.Join(tried, ", "), lastErr), httpStatus(lastErr))
+}
+
+// podAction issues POST /pods/{id}/action, v2's state-transition endpoint
+// (start | stop | restart | terminate). start/stop/restart answer 200 with
+// the updated pod; terminate answers 204 with no body, for which the
+// returned pod is zero.
+//
+// No Provider verb maps onto stop/start today: iplane rents and releases,
+// it does not pause, and Terminate uses DELETE /pods/{id}, the documented
+// equivalent of the terminate action. This is the one place the transition
+// endpoint is spoken, so a future pause verb does not have to rediscover
+// its shape.
+func (p *Provider) podAction(ctx context.Context, podID, action string) (podBody, error) {
+	if podID == "" {
+		return podBody{}, provisioners.NewProviderError(p.Name(), action, fmt.Errorf("providerID is empty"), 0)
+	}
+	req, err := p.client.newReq("POST", "/pods/"+url.PathEscape(podID)+"/action", nil, podActionRequest{Action: action})
+	if err != nil {
+		return podBody{}, provisioners.NewProviderError(p.Name(), action, err, 0)
+	}
+	pod, err := skhttp.Call[podBody](ctx, req, p.client.callOpts()...)
+	if err != nil {
+		return podBody{}, wrapErr(action, err)
+	}
+	return pod, nil
+}
+
+// getPod reads GET /pods/{id}.
+func (p *Provider) getPod(ctx context.Context, podID string) (podBody, error) {
+	req, err := p.client.newReq("GET", "/pods/"+url.PathEscape(podID), nil, nil)
+	if err != nil {
+		return podBody{}, err
+	}
+	return skhttp.Call[podBody](ctx, req, p.client.callOpts()...)
+}
+
 // WaitForSSHReady waits until the pod's SSH endpoint is genuinely
-// usable -- both (1) RunPod has assigned the public IP and (2) the
-// pod's sshd is accepting TCP connections on port 22. Both conditions
-// have an unbounded tail (RunPod's IP assignment ~5-10s, container
-// boot + sshd startup another ~10-30s), and the whole window has to
-// elapse before a Phase 2 deployment can SSH in. This is the single
-// "Join" point for callers.
+// usable -- both (1) RunPod has published a direct SSH endpoint (a
+// public host and port for the pod's 22/tcp) and (2) the pod's sshd is
+// accepting TCP connections on it. Both conditions have an unbounded
+// tail (RunPod's port assignment ~5-10s, container boot + sshd startup
+// another ~10-30s), and the whole window has to elapse before a Phase 2
+// deployment can SSH in. This is the single "Join" point for callers.
 //
 // Returns the resolved SshTarget on success, or an error on timeout
 // / ctx cancellation / underlying GET failure. On timeout, the
@@ -416,20 +518,15 @@ func (p *Provider) WaitForSSHReady(ctx context.Context, providerID string) (*pro
 		first = false
 		if time.Now().After(deadline) {
 			return sshTargetFromPod(&last), provisioners.NewProviderError(p.Name(), "wait_ssh_ready",
-				fmt.Errorf("public ip not assigned within %s", timeout), 0)
+				fmt.Errorf("no direct ssh endpoint published within %s", timeout), 0)
 		}
-		getReq, err := p.client.newReq("GET", "/pods/"+providerID, nil, nil)
-		if err != nil {
-			return nil, provisioners.NewProviderError(p.Name(), "wait_ssh_ready", err, 0)
-		}
-		pod, err := skhttp.Call[podBody](ctx, getReq, p.client.callOpts()...)
+		pod, err := p.getPod(ctx, providerID)
 		if err != nil {
 			return sshTargetFromPod(&last), wrapErr("wait_ssh_ready", err)
 		}
 		last = pod
-		if pod.PublicIP != "" {
-			target := sshTargetFromPod(&pod)
-			// Stage 2: probe tcp/22 until sshd inside the pod is
+		if target := sshTargetFromPod(&pod); target != nil {
+			// Stage 2: probe the port until sshd inside the pod is
 			// reachable. Reuses the same deadline + interval so the
 			// overall budget covers both stages.
 			if err := p.waitForSSHPort(ctx, target, deadline, interval); err != nil {
@@ -468,39 +565,22 @@ func (p *Provider) waitForSSHPort(ctx context.Context, target *provisionerv1.Ssh
 	}
 }
 
-// sshTargetFromPod builds a SshTarget from a podBody. Honors RunPod's
-// portMappings field -- a pod whose internal port 22 is NATed to a
-// random external port (e.g. 22085) returns that external port, not
-// 22, so the operator's ssh / the deployment executor's dial lands
-// on the container's sshd and not the host's. Returns nil when
-// PublicIP is empty so callers can distinguish "haven't observed an
-// IP yet" from "observed an IP and it's literally blank."
+// sshTargetFromPod builds a SshTarget from the pod's direct SSH endpoint.
+// RunPod NATs the container's 22/tcp onto an arbitrary public port (e.g.
+// 22085), so the port comes from the endpoint and is not assumed to be 22;
+// dialing 22 would land on the host's sshd or nothing at all. Returns nil
+// when no direct endpoint is published yet, so callers can distinguish
+// "haven't observed one" from "observed one".
+//
+// Only `ssh.direct` qualifies. `ssh.proxy` (ssh.runpod.io) carries an
+// interactive shell only, without the port forwarding and file copy the
+// deployment executor needs.
 func sshTargetFromPod(pod *podBody) *provisionerv1.SshTarget {
-	if pod == nil || pod.PublicIP == "" {
+	host, port, user := pod.directSSH()
+	if host == "" {
 		return nil
 	}
-	return &provisionerv1.SshTarget{
-		Host: pod.PublicIP,
-		Port: sshPortFromPod(pod),
-		User: "root",
-	}
-}
-
-// sshPortFromPod resolves the externally-dialable port for the
-// container's sshd. RunPod sometimes maps the container's port 22
-// to an arbitrary public-side port (random in the dynamic-port
-// range); the operator dials that public port, RunPod's NAT
-// forwards to container:22. Without the lookup we'd dial port 22
-// directly and either hit the host's sshd (wrong keys) or time
-// out (no service listening on that port).
-//
-// Falls back to 22 when no mapping is reported -- some RunPod
-// configurations expose port 22 as-is on the public IP.
-func sshPortFromPod(pod *podBody) int32 {
-	if mapped, ok := pod.PortMappings["22"]; ok && mapped > 0 {
-		return int32(mapped)
-	}
-	return 22
+	return &provisionerv1.SshTarget{Host: host, Port: port, User: user}
 }
 
 // Terminate calls DELETE /pods/{id}. Idempotent: a 404 (not found)
@@ -510,7 +590,7 @@ func (p *Provider) Terminate(ctx context.Context, providerID string) error {
 	if providerID == "" {
 		return provisioners.NewProviderError(p.Name(), "terminate", fmt.Errorf("providerID is empty"), 0)
 	}
-	req, err := p.client.newReq("DELETE", "/pods/"+providerID, nil, nil)
+	req, err := p.client.newReq("DELETE", "/pods/"+url.PathEscape(providerID), nil, nil)
 	if err != nil {
 		return provisioners.NewProviderError(p.Name(), "terminate", err, 0)
 	}
@@ -530,24 +610,32 @@ func (p *Provider) Describe(ctx context.Context, providerID string) (*provisione
 	if providerID == "" {
 		return nil, provisioners.NewProviderError(p.Name(), "describe", fmt.Errorf("providerID is empty"), 0)
 	}
-	req, err := p.client.newReq("GET", "/pods/"+providerID, nil, nil)
-	if err != nil {
-		return nil, provisioners.NewProviderError(p.Name(), "describe", err, 0)
-	}
-	pod, err := skhttp.Call[podBody](ctx, req, p.client.callOpts()...)
+	pod, err := p.getPod(ctx, providerID)
 	if err != nil {
 		return nil, wrapErr("describe", err)
 	}
-	tags := map[string]string{}
-	if name := strings.TrimPrefix(pod.Name, podNamePrefix); name != pod.Name && name != "" {
-		tags[provisioners.TagID] = name
-	}
+	tags := tagsFromPodName(pod.Name)
 	return p.podToInstance(&pod, specFromPod(&pod, tags), classifySKU(pod.gpuSKU()), pod.gpuSKU(), pod.gpuCountInt()), nil
 }
 
-// List calls GET /pods. When the filter includes iplane-id, we add
-// ?name=iplane-<id> for server-side filtering, then apply the full filter
-// match-all over the tags recovered from the pod name.
+// tagsFromPodName recovers the iplane tags encoded in a pod name. Only
+// iplane-id survives the round trip; a pod without the prefix is one the
+// operator created outside iplane and carries none.
+func tagsFromPodName(name string) map[string]string {
+	tags := map[string]string{}
+	if id := strings.TrimPrefix(name, podNamePrefix); id != name && id != "" {
+		tags[provisioners.TagID] = id
+	}
+	return tags
+}
+
+// List calls GET /pods, walks every page, and applies the filter
+// match-all over the tags recovered from each pod name.
+//
+// v2 has no name filter on GET /pods (v1 had ?name=), so all the
+// filtering is client-side. The listing is the account's pods, newest
+// first, a thousand to a page, which keeps this one request for any
+// account iplane is likely to see.
 //
 // iplane-id is the only tag that ends up encoded on a pod, so filtering on
 // anything else matches nothing. That is the honest answer to a question
@@ -558,45 +646,34 @@ func (p *Provider) Describe(ctx context.Context, providerID string) (*provisione
 // Operator-level scope is the state file's, and the API key already bounds
 // the account.
 func (p *Provider) List(ctx context.Context, filter map[string]string) ([]*provisionerv1.InstanceRef, error) {
-	q := url.Values{}
-	if id, ok := filter[provisioners.TagID]; ok && id != "" {
-		q.Set("name", podNamePrefix+id)
-	}
-
-	req, err := p.client.newReq("GET", "/pods", q, nil)
+	pods, err := listAll(ctx, p.client, "list", "/pods", func(r listPodsResponse) ([]podBody, pagination) {
+		return r.Pods, r.Pagination
+	})
 	if err != nil {
-		return nil, provisioners.NewProviderError(p.Name(), "list", err, 0)
-	}
-	pods, err := skhttp.Call[[]podBody](ctx, req, p.client.callOpts()...)
-	if err != nil {
-		return nil, wrapErr("list", err)
+		return nil, err
 	}
 
 	refs := make([]*provisionerv1.InstanceRef, 0, len(pods))
 	for i := range pods {
 		pod := &pods[i]
-		tags := map[string]string{}
-		if name := strings.TrimPrefix(pod.Name, podNamePrefix); name != pod.Name && name != "" {
-			tags[provisioners.TagID] = name
-		}
+		tags := tagsFromPodName(pod.Name)
 		if !provisioners.MatchesTags(tags, filter) {
 			continue
 		}
 		refs = append(refs, &provisionerv1.InstanceRef{
 			ProviderId:    pod.ID,
-			ProviderState: pod.DesiredStatus,
+			ProviderState: pod.Status,
 			Tags:          tags,
-			HourlyRateUsd: pod.CostPerHr,
+			HourlyRateUsd: pod.Cost,
 			CreatedAt:     parseRunPodTime(pod.CreatedAt),
 		})
 	}
 	return refs, nil
 }
 
-// podToInstance assembles the iplane Instance from a fully-populated
-// pod record (the response of GET /pods/{id}). resolvedClass and
-// resolvedSKU come from the caller because Spawn knows them up-front
-// and RunPod's response sometimes omits them pre-runtime-ready.
+// podToInstance assembles the iplane Instance from a pod record.
+// resolvedClass and resolvedSKU come from the caller because Spawn
+// knows them up-front.
 func (p *Provider) podToInstance(pod *podBody, spec *provisionerv1.Spec, resolvedClass, resolvedSKU string, gpuCount int) *provisionerv1.Instance {
 	createdAt := parseRunPodTime(pod.CreatedAt)
 	now := timestamppb.New(p.clock())
@@ -609,18 +686,19 @@ func (p *Provider) podToInstance(pod *podBody, spec *provisionerv1.Spec, resolve
 	if gpuCount <= 0 {
 		gpuCount = pod.gpuCountInt()
 	}
-	vramGB := pod.gpuVRAMGB()
+	vramGB := gpuVRAMGB(resolvedSKU)
 
 	ssh := &provisionerv1.SshTarget{}
-	if pod.PublicIP != "" {
-		ssh.Host = pod.PublicIP
-		ssh.Port = sshPortFromPod(pod)
-		ssh.User = "root"
+	if t := sshTargetFromPod(pod); t != nil {
+		ssh = t
 	}
 
-	region := pod.dataCenter()
+	region := pod.DataCenterID
 	if region == "" {
 		region = spec.GetRegion()
+	}
+	if createdAt == nil {
+		createdAt = now
 	}
 
 	return &provisionerv1.Instance{
@@ -633,13 +711,13 @@ func (p *Provider) podToInstance(pod *podBody, spec *provisionerv1.Spec, resolve
 			hw := &provisionerv1.Hardware{
 				GpuSku:    resolvedSKU,
 				GpuCount:  int32(gpuCount),
-				GpuVramMb: int32(vramGB * 1024), // pod.gpuVRAMGB returns GB; convert to MB
+				GpuVramMb: int32(vramGB * 1024), // gpuVRAMGB returns GB; convert to MB
 			}
 			stampFabric(hw, resolvedSKU)
 			return hw
 		}(),
-		Metadata:      runpodMetadata(pod, resolvedClass),
-		HourlyRateUsd: pod.CostPerHr,
+		Metadata:      runpodMetadata(resolvedClass),
+		HourlyRateUsd: pod.Cost,
 		State:         provisionerv1.InstanceState_INSTANCE_STATE_ACTIVE,
 		CreatedAt:     createdAt,
 		ActivatedAt:   now,
@@ -648,53 +726,17 @@ func (p *Provider) podToInstance(pod *podBody, spec *provisionerv1.Spec, resolve
 }
 
 // runpodMetadata captures the RunPod-specific fields outside the
-// Hardware base. machine_id is the most useful: it identifies the
-// underlying physical host, useful for leak detection if RunPod
-// retires a host. The class id stays in metadata because v0.2's
-// Hardware base is per-instance hardware, not the iplane class
-// taxonomy (which is derivable from gpu_vram_mb).
-func runpodMetadata(pod *podBody, class string) map[string]*structpb.Value {
-	out := map[string]*structpb.Value{}
-	if pod.MachineID != "" {
-		out["runpod.machine_id"] = structpb.NewStringValue(pod.MachineID)
-	}
-	if class != "" {
-		out["runpod.class"] = structpb.NewStringValue(class)
-	}
-	if len(out) == 0 {
+// Hardware base. The class id stays in metadata because v0.2's Hardware
+// base is per-instance hardware, not the iplane class taxonomy (which is
+// derivable from gpu_vram_mb).
+//
+// runpod.machine_id used to ride here too. v2's pod record carries no
+// machine id at all, so it is gone rather than left empty.
+func runpodMetadata(class string) map[string]*structpb.Value {
+	if class == "" {
 		return nil
 	}
-	return out
-}
-
-// instanceFromCreate builds a minimum-viable Instance when the
-// post-create GET /pods/{id} fails. Used as a fallback so a temporary
-// follow-up failure does not lose the operator's pod (it exists in
-// RunPod even though we cannot read its full record right now). Later
-// list / describe calls will populate the gaps.
-func (p *Provider) instanceFromCreate(spec *provisionerv1.Spec, created *createPodResponse, resolvedClass, resolvedSKU string, gpuCount int) *provisionerv1.Instance {
-	now := timestamppb.New(p.clock())
-	return &provisionerv1.Instance{
-		Id:         spec.GetId(),
-		ProviderId: created.ID,
-		Provider:   p.Name(),
-		Spec:       spec,
-		Region:     spec.GetRegion(),
-		Hardware: func() *provisionerv1.Hardware {
-			hw := &provisionerv1.Hardware{
-				GpuSku:   resolvedSKU,
-				GpuCount: int32(gpuCount),
-			}
-			stampFabric(hw, resolvedSKU)
-			return hw
-		}(),
-		Metadata: map[string]*structpb.Value{
-			"runpod.class": structpb.NewStringValue(resolvedClass),
-		},
-		State:       provisionerv1.InstanceState_INSTANCE_STATE_ACTIVE,
-		CreatedAt:   now,
-		ActivatedAt: now,
-	}
+	return map[string]*structpb.Value{"runpod.class": structpb.NewStringValue(class)}
 }
 
 // specFromPod reconstructs an approximate Spec for an externally-found
@@ -705,13 +747,13 @@ func specFromPod(pod *podBody, tags map[string]string) *provisionerv1.Spec {
 	return &provisionerv1.Spec{
 		Id:        tags[provisioners.TagID],
 		Provider:  provisioners.ProviderRunPod,
-		Region:    pod.dataCenter(),
+		Region:    pod.DataCenterID,
 		BaseImage: pod.Image,
 		Tags:      tags,
 		Requirements: &provisionerv1.ResourceRequirements{
 			Sku:       pod.gpuSKU(),
 			GpuCount:  int32(pod.gpuCountInt()),
-			MinVramGb: int32(pod.gpuVRAMGB()),
+			MinVramGb: int32(gpuVRAMGB(pod.gpuSKU())),
 		},
 	}
 }
@@ -747,205 +789,250 @@ func isWrappedNotFound(err error) bool {
 	return false
 }
 
-// createPodRequest is the JSON body for POST /pods. Field names match
-// RunPod's REST docs exactly so the wire shape is debuggable from the
-// Go side. Omit-empty everywhere; the API treats missing fields as
-// "use the documented default."
+// createPodRequest is the JSON body for POST /v2/pods (CreatePodRequest
+// in RunPod's OpenAPI). The schema closes the object
+// (unevaluatedProperties: false), so every field here must be one it
+// names; an unknown field is a 422, not a silently ignored extra.
+//
+// Mapping from the v1 body this replaced:
+//
+//	imageName                 -> image
+//	gpuTypeIds + gpuCount     -> gpu.id + gpu.count (one type per create)
+//	minRAMPerGPU              -> gpu.minRamPerGpu
+//	computeType=CPU           -> cpu.id + cpu.vcpuCount (a flavor, see stage.go)
+//	cloudType                 -> cloud
+//	containerDiskInGb         -> disk
+//	networkVolumeId + path    -> mounts.network[{volumeId, path}]
+//	volumeInGb                -> mounts.persistent (never used: always 0)
+//	dockerStartCmd            -> cmd
+//	dockerEntrypoint          -> entrypoint
+//	supportPublicIp           -> no equivalent; see the cloud comment above
+//	gpuTypePriority           -> no equivalent; createPod walks the list
 type createPodRequest struct {
-	Name              string   `json:"name,omitempty"`
-	ImageName         string   `json:"imageName,omitempty"`
-	GPUTypeIDs        []string `json:"gpuTypeIds,omitempty"`
-	GPUTypePriority   string   `json:"gpuTypePriority,omitempty"`
-	GPUCount          int      `json:"gpuCount,omitempty"`
-	MinRAMPerGPU      int      `json:"minRAMPerGPU,omitempty"` // RunPod expresses RAM per-GPU; we convert from per-instance.
-	CloudType         string   `json:"cloudType,omitempty"`
-	ComputeType       string   `json:"computeType,omitempty"`
-	ContainerDiskInGB int      `json:"containerDiskInGb,omitempty"`
-	VolumeInGB        int      `json:"volumeInGb,omitempty"`
-	NetworkVolumeID   string   `json:"networkVolumeId,omitempty"`
-	VolumeMountPath   string   `json:"volumeMountPath,omitempty"` // where networkVolumeId attaches inside the pod
-
+	Name  string `json:"name"`
+	Image string `json:"image,omitempty"`
+	// Cloud is SECURE or COMMUNITY; RunPod defaults to SECURE. createPod
+	// sets it per placement.
+	Cloud string     `json:"cloud,omitempty"`
+	GPU   *createGPU `json:"gpu,omitempty"`
+	CPU   *createCPU `json:"cpu,omitempty"`
+	// Disk is the container disk in GB, ephemeral.
+	Disk  int               `json:"disk,omitempty"`
 	Ports []string          `json:"ports,omitempty"`
-	Env   map[string]string `json:"env,omitempty"` // RunPod's REST uses a flat key/value map.
-	// DockerStartCmd REPLACES the image's CMD with these argv tokens
-	// (ENTRYPOINT — the engine binary — stays). RunPod's REST API
-	// removed the legacy single-string `dockerArgs` in favor of these
-	// two array fields; we pass args as an argv slice, not a shell-split
-	// string.
-	DockerStartCmd   []string `json:"dockerStartCmd,omitempty"`
-	DockerEntrypoint []string `json:"dockerEntrypoint,omitempty"`
-	Interruptible    bool     `json:"interruptible,omitempty"`
-	TemplateID       string   `json:"templateId,omitempty"`
-	SupportPublicIP  bool     `json:"supportPublicIp,omitempty"`
-	DataCenterIDs    []string `json:"dataCenterIds,omitempty"` // best-effort; if rejected, RunPod schedules anywhere
+	Env   map[string]string `json:"env,omitempty"`
+	// Cmd REPLACES the image's CMD with these argv tokens (exec form);
+	// the image's ENTRYPOINT -- the engine binary -- stays unless
+	// Entrypoint is also set.
+	Cmd           []string   `json:"cmd,omitempty"`
+	Entrypoint    []string   `json:"entrypoint,omitempty"`
+	Mounts        *podMounts `json:"mounts,omitempty"`
+	DataCenterIDs []string   `json:"dataCenterIds,omitempty"` // preferred datacenters; empty lets the scheduler choose
+	StartSSH      bool       `json:"startSsh,omitempty"`      // inject the account's registered keys as PUBLIC_KEY
 }
 
-// createPodResponse is the minimal response shape from POST /pods.
-// We immediately follow up with GET /pods/{id} for the full record.
-type createPodResponse struct {
-	ID            string `json:"id"`
-	DesiredStatus string `json:"desiredStatus"`
-	Status        string `json:"status"`
-	// CostPerHr is bound so the deploy can report what it just rented.
-	// The instance record otherwise learns the price from a Describe that
-	// only runs when the deploy succeeds, so a deploy that rents a pod and
-	// then fails records no rate at all (#397). Absent in a response leaves
-	// it zero, which is what unknown already means everywhere else.
-	CostPerHr float64 `json:"costPerHr"`
+// createGPU is CreateGpuConfig: one GPU type, a count, and placement
+// filters on the host.
+type createGPU struct {
+	ID           string `json:"id"`
+	Count        int    `json:"count,omitempty"`
+	MinRAMPerGPU int    `json:"minRamPerGpu,omitempty"` // RunPod expresses RAM per-GPU; we convert from per-instance.
 }
 
-// podBody mirrors the subset of RunPod's pod schema we consume. We
-// deliberately do not bind every field RunPod returns -- only the
-// ones that flow through to the iplane Instance.
+// createCPU is CreateCpuConfig: a CPU flavor from GET /catalog/cpus and a
+// power-of-two vCPU count valid for it.
+type createCPU struct {
+	ID        string `json:"id"`
+	VCPUCount int    `json:"vcpuCount"`
+}
+
+// podMounts is the subset of Mounts this adapter attaches: at most one
+// network volume (maxItems is 1 today).
+type podMounts struct {
+	Network []networkMount `json:"network,omitempty"`
+}
+
+// networkMount attaches an existing network volume. Path has no default
+// in v2 and must be sent.
+type networkMount struct {
+	VolumeID string `json:"volumeId"`
+	Path     string `json:"path"`
+}
+
+// podActionRequest is the body for POST /pods/{id}/action.
+type podActionRequest struct {
+	Action string `json:"action"`
+}
+
+// listPodsResponse is GET /pods: the pods wrapped under a key, plus the
+// cursor block.
+type listPodsResponse struct {
+	Pods       []podBody  `json:"pods"`
+	Pagination pagination `json:"pagination"`
+}
+
+// podBody mirrors the subset of v2's Pod schema we consume. We
+// deliberately do not bind every field RunPod returns -- only the ones
+// that flow through to the iplane Instance or the cold-start phase
+// ladder. Nullable strings (dataCenterId, cudaVersion, startedAt) decode
+// to "" when null.
 type podBody struct {
-	ID            string  `json:"id"`
-	Name          string  `json:"name"`
-	Image         string  `json:"image"`
-	MachineID     string  `json:"machineId"`
-	CostPerHr     float64 `json:"costPerHr"`
-	CreatedAt     string  `json:"createdAt"`
-	DesiredStatus string  `json:"desiredStatus"`
-	// LastStartedAt is RunPod's UTC timestamp for when the pod's
-	// container process last started. classifyEnginePhase treats a
-	// non-empty value as the "image-pull done, engine now initializing"
-	// signal (see deployer.go).
-	//
-	// WRONG: that reading is disproven. Traced live 2026-08-09, RunPod
-	// stamps this at pod-record creation, NOT at container start -- it
-	// read 06:19:04.093 against a createdAt of 06:19:04.100 (7ms
-	// earlier) and never changed across a 2m14s deploy. Because
-	// classifyEnginePhase tests `started` first, a non-empty value on
-	// the first probe pins the phase to engine:init at t=0 and makes
-	// runpod:image-pull unreachable, which is why that phase measures
-	// ~0s on every run.
-	//
-	// Do not use this field as a container-start boundary. The working
-	// signal is `runtime` (null until the container starts), exposed by
-	// GraphQL v1 and REST v2 but absent from REST v1. See issue 208,
-	// docs/deployment-observability.md ("Known gap"), and
-	// docs/design/0005-engine-image-coldstart.md.
-	LastStartedAt string   `json:"lastStartedAt"`
-	PublicIP      string   `json:"publicIp"`
-	Ports         []string `json:"ports"`
-	// PortMappings encodes RunPod's NAT for ports declared in the
-	// create-pod request. Keys are container-internal ports (as
-	// strings, JSON-style), values are the public-IP-side ports.
-	// Example: {"22": 22085} means an operator dialing publicIp:22085
-	// reaches the container's port 22. SSH wires this through into
-	// Ssh.Port; without the translation, every dial hits the host's
-	// sshd or nothing at all.
-	PortMappings map[string]int `json:"portMappings"`
-	Machine      *podMachine    `json:"machine"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Image string `json:"image"`
+	// Status is PROVISIONING | STARTING | RUNNING | EXITED | ERROR |
+	// TERMINATED. It replaces v1's desiredStatus, and like it describes
+	// the rental more than the container: an exited container is
+	// restarted and the pod keeps reading RUNNING (NOTES.md).
+	Status string `json:"status"`
+	// Cost is the current rate in USD per hour (0 once EXITED or
+	// TERMINATED). v1 called it costPerHr.
+	Cost      float64 `json:"cost"`
+	CreatedAt string  `json:"createdAt"`
+	// StartedAt is when the pod last started. Recorded for the phase
+	// trace only. Its v1 predecessor lastStartedAt was stamped at pod
+	// creation rather than container start (issue 208), and nothing has
+	// shown this one behaves differently, so it is not used as a phase
+	// boundary.
+	StartedAt string `json:"startedAt"`
+	// DataCenterID and CudaVersion are both properties of the host, set
+	// once the scheduler has placed the pod. They replace v1's machineId
+	// as the host-assignment signal (machinePresent).
+	DataCenterID string      `json:"dataCenterId"`
+	CudaVersion  string      `json:"cudaVersion"`
+	GPU          *podGPU     `json:"gpu"`
+	Ports        []string    `json:"ports"`
+	SSH          *podSSH     `json:"ssh"`
+	Runtime      *podRuntime `json:"runtime"`
 }
 
-type podMachine struct {
-	GPUTypeID    string   `json:"gpuTypeId"`
-	GPUCount     int      `json:"gpuCount"`
-	DataCenterID string   `json:"dataCenterId"`
-	GPUType      *gpuType `json:"gpuType"`
+// podGPU is GpuConfig. Memory is the pod's total SYSTEM RAM in GB, not
+// VRAM; v2's pod record does not report VRAM, which comes from the SKU
+// catalog instead (gpuVRAMGB).
+type podGPU struct {
+	ID        string  `json:"id"`
+	Count     int     `json:"count"`
+	VCPUCount float64 `json:"vcpuCount"`
+	Memory    float64 `json:"memory"`
 }
 
-type gpuType struct {
-	ID         string `json:"id"`
-	MemoryInGB int    `json:"memoryInGb"`
-	Count      int    `json:"count"`
+// podSSH is PodSsh. Proxy goes through ssh.runpod.io and exists once the
+// pod has a machine; Direct is the pod's own sshd on its published
+// 22/tcp, null until the running pod has a public port for it.
+type podSSH struct {
+	Proxy  *podSSHEndpoint `json:"proxy"`
+	Direct *podSSHEndpoint `json:"direct"`
+}
+
+type podSSHEndpoint struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
 }
 
 func (p *podBody) gpuSKU() string {
-	if p.Machine != nil && p.Machine.GPUType != nil && p.Machine.GPUType.ID != "" {
-		return p.Machine.GPUType.ID
-	}
-	if p.Machine != nil {
-		return p.Machine.GPUTypeID
+	if p.GPU != nil {
+		return p.GPU.ID
 	}
 	return ""
-}
-
-func (p *podBody) gpuVRAMGB() int {
-	if p.Machine != nil && p.Machine.GPUType != nil {
-		return p.Machine.GPUType.MemoryInGB
-	}
-	return 0
 }
 
 func (p *podBody) gpuCountInt() int {
-	if p.Machine != nil {
-		if p.Machine.GPUCount > 0 {
-			return p.Machine.GPUCount
-		}
-		if p.Machine.GPUType != nil && p.Machine.GPUType.Count > 0 {
-			return p.Machine.GPUType.Count
-		}
+	if p.GPU != nil {
+		return p.GPU.Count
 	}
 	return 0
 }
 
-func (p *podBody) dataCenter() string {
-	if p.Machine != nil {
-		return p.Machine.DataCenterID
+// directSSH returns the pod's direct SSH endpoint, or an empty host when
+// none is published. Falls back to the live port mapping in `runtime`
+// (private 22 with a public IP and port), which carries the same fact.
+func (p *podBody) directSSH() (host string, port int32, user string) {
+	if p.SSH != nil && p.SSH.Direct != nil && p.SSH.Direct.Host != "" {
+		port = int32(p.SSH.Direct.Port)
+		if port == 0 {
+			port = 22
+		}
+		user = p.SSH.Direct.Username
+		if user == "" {
+			user = "root"
+		}
+		return p.SSH.Direct.Host, port, user
 	}
-	return ""
+	if p.Runtime != nil {
+		for _, rp := range p.Runtime.Ports {
+			if rp.Private == 22 && rp.IP != "" && rp.Public > 0 {
+				return rp.IP, int32(rp.Public), "root"
+			}
+		}
+	}
+	return "", 0, ""
 }
 
-// machinePresent reports whether RunPod has scheduled the pod onto a
-// concrete host yet. Freshly-rented pods return an empty machine object
-// ("machine": {}) from the immediate follow-up GET and the populated
-// record lands a few seconds later (see the RunPod-machine gotcha in
-// CLAUDE.md), so a non-nil but empty Machine still counts as "not
-// scheduled." Any real field populated means capacity was found.
+// gpuVRAMGB is the per-card VRAM for a SKU from the static catalog, or 0
+// for a SKU we have not catalogued. v1's pod record carried
+// machine.gpuType.memoryInGb; v2's carries no VRAM figure at all.
+func gpuVRAMGB(sku string) int {
+	if spec := LookupSKU(sku); spec != nil {
+		return spec.VRAMGb
+	}
+	return 0
+}
+
+// machinePresent reports whether RunPod has placed the pod on a host.
 //
-// "A few seconds later" turned out to be optimistic (issue 208): traced
-// live 2026-08-09, `machine` stayed {} for an entire 2m14s deploy while
-// RunPod populated the top-level `machineId` immediately. Keying only on
-// the nested object meant this returned false throughout and the
-// runpod:scheduling -> image-pull transition never fired, so a non-empty
-// MachineID counts as scheduled too.
+// v1 carried this as machineId (and a `machine` object that stayed {} for
+// a whole deploy, issue 208). v2 has neither; what it has are fields only
+// a host can supply: the datacenter the scheduler assigned, the host's
+// CUDA version, and the SSH proxy endpoint, which is "null until the pod
+// has a machine assignment". Any one counts. Present-but-empty values do
+// not, for the same reason `machine: {}` did not.
+//
+// Because v2's create places the pod synchronously (a 400 when it cannot),
+// these are often already set on the 201, so runpod:scheduling may be
+// near-instant on v2. That is a measurement to make with
+// IPLANE_RUNPOD_PHASE_TRACE, not an assumption to build on.
 func (p *podBody) machinePresent() bool {
-	if p.MachineID != "" {
+	if p.DataCenterID != "" || p.CudaVersion != "" {
 		return true
 	}
-	m := p.Machine
-	if m == nil {
-		return false
-	}
-	return m.GPUTypeID != "" || m.DataCenterID != "" || m.GPUCount > 0 ||
-		(m.GPUType != nil && m.GPUType.ID != "")
+	return p.SSH != nil && p.SSH.Proxy != nil && p.SSH.Proxy.Host != ""
 }
 
-// podV2Body is the slice of RunPod's v2 pod-status response this adapter
-// reads. Only `runtime` matters: it is null until the container starts,
-// which makes it the image-pull -> engine-init boundary (issue 208). v1
-// does not return this field at all.
-type podV2Body struct {
-	Runtime *podV2Runtime `json:"runtime"`
+// podRuntime is v2's PodRuntime block. It is null until the container
+// starts, which makes it the image-pull -> engine-init boundary (issue
+// 208). Field presence is the signal; the values are utilization samples
+// we don't use.
+type podRuntime struct {
+	Uptime int              `json:"uptime"`
+	Ports  []podRuntimePort `json:"ports"`
+	CPU    *podUtil         `json:"cpu"`
+	Memory *podUtil         `json:"memory"`
+	GPUs   []podUtil        `json:"gpus"`
 }
 
-// podV2Runtime is RunPod's container-runtime block. Field presence is
-// the signal; the values are utilization samples we don't use.
-type podV2Runtime struct {
-	Ports  []podV2RuntimePort `json:"ports"`
-	CPU    *podV2Util         `json:"cpu"`
-	Memory *podV2Util         `json:"memory"`
-	GPUs   []podV2Util        `json:"gpus"`
+// podRuntimePort is one live port mapping. Public and IP are null for an
+// /http port, which is proxied rather than published.
+type podRuntimePort struct {
+	Private int    `json:"private"`
+	Public  int    `json:"public"`
+	Type    string `json:"type"`
+	IP      string `json:"ip"`
 }
 
-type podV2RuntimePort struct {
-	PrivatePort int `json:"privatePort"`
-}
-
-type podV2Util struct {
+type podUtil struct {
 	Util int `json:"util"`
 }
 
 // containerStarted reports whether the engine container is actually
 // running. Mirrors machinePresent's defensiveness: RunPod has a habit of
-// returning a present-but-empty object ("machine": {}), so an empty
-// runtime block counts as not-started rather than started.
-func (r *podV2Runtime) containerStarted() bool {
+// returning a present-but-empty object (the documented create response
+// carries "runtime": {}), so an empty runtime block counts as not-started
+// rather than started.
+func (r *podRuntime) containerStarted() bool {
 	if r == nil {
 		return false
 	}
-	return len(r.Ports) > 0 || r.CPU != nil || r.Memory != nil || len(r.GPUs) > 0
+	return r.Uptime > 0 || len(r.Ports) > 0 || r.CPU != nil || r.Memory != nil || len(r.GPUs) > 0
 }
 
 // Compile-time check.

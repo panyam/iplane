@@ -2,136 +2,174 @@ package runpod
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
 	"github.com/inference-book/inference-plane/internal/provisioners"
 	"github.com/inference-book/inference-plane/internal/provisioners/fabric"
 	"github.com/inference-book/inference-plane/internal/provisioners/skucatalog"
+	skhttp "github.com/panyam/servicekit/http"
 )
 
-// gpuTypesQuery asks for every GPU type plus what it would cost and whether
-// any can be had at the requested width.
+// The catalog reads behind Candidates, all on REST v2:
 //
-// lowestPrice takes the gpuCount, and that argument is the whole reason this
-// is worth a network call. Availability is not a property of a card, it is a
-// property of a card AT a width: probing live on 2026-08-15, 35 of 48 types
-// were obtainable as a single GPU and only 11 of 48 as eight. A catalog cannot
-// express that and neither can --dry-run.
+//   - GET /catalog/gpus?include=AVAILABILITY&product=POD&count=N&cloud=C
+//     answers price and stock per GPU type, overall and per datacenter, at
+//     a width. It replaces GraphQL's gpuTypes { lowestPrice(gpuCount) } and
+//     dataCenters { gpuAvailability(gpuCount) }, which until 2026-10 were
+//     the only catalog RunPod published (REST v1 had none).
+//   - GET /catalog/datacenters answers which datacenters hold network
+//     volumes (networkVolumeTypes, empty means none), which GraphQL carried
+//     as storageSupport.
 //
-// GraphQL rather than REST because rest.runpod.io/v1 has no catalog endpoint
-// at all (GET /v1/gpus 400s with "that path does not exist in the
-// specification"). Same split as SSH keys, which is why gqlPost already
-// exists.
-const gpuTypesQuery = `query { gpuTypes { id displayName memoryInGb secureCloud communityCloud lowestPrice(input:{gpuCount:%d}) { uninterruptablePrice minimumBidPrice stockStatus } } dataCenters { id location storageSupport gpuAvailability(input:{gpuCount:%d}) { gpuTypeId available stockStatus } } }`
-
-// The dataCenters half is what says WHERE the capacity is, at the same
-// width, and RunPod does publish it. This adapter used to say otherwise:
-// "RunPod schedules wherever it has capacity" described the rent path's
-// default rather than what the API knows.
+// The width argument is the whole reason this is worth a network call.
+// Availability is not a property of a card, it is a property of a card AT
+// a width: probing live on 2026-08-15, 35 of 48 types were obtainable as a
+// single GPU and only 11 of 48 as eight. A catalog cannot express that and
+// neither can --dry-run.
 //
-// The datacenter is decision-relevant rather than trivia, because a network
-// volume is locked to one. A model staged into the wrong datacenter is a
-// warm cache no deploy can ever mount, and Spawn already accepts a region
-// as a best-effort pin (dataCenterIds), so the answer is actionable.
+// The datacenter half is what says WHERE the capacity is, and it is
+// decision-relevant rather than trivia, because a network volume is locked
+// to one. A model staged into the wrong datacenter is a warm cache no
+// deploy can ever mount, and Spawn already accepts a region as a
+// best-effort pin (dataCenterIds), so the answer is actionable. Found while
+// planning #358: RunPod had eight-card capacity in exactly one datacenter,
+// and that one supports no volumes at all.
 //
-// Found while planning #358: RunPod had eight-card capacity in exactly one
-// datacenter, and that one supports no volumes at all. Nothing in `iplane
-// capacity` could say so, which sent the planning to GraphQL by hand.
+// Two things v2's catalog does not carry, and what the adapter does about
+// each:
+//
+//   - A whole-shape price. GraphQL's lowestPrice priced the shape at the
+//     requested gpuCount; v2 publishes a list price for ONE card per cloud
+//     and says the rate for a unit is that figure times the count. So the
+//     candidate price is price x count. The billed rate is still whatever
+//     the pod reports as `cost` once rented.
+//   - Any interruptible tier. GraphQL had minimumBidPrice (which equalled
+//     the on-demand price on every shape measured, see NOTES.md); v2 has
+//     no bid price in the catalog and no bid or interruptible field on
+//     the create. A reclaimable search therefore gets no RunPod
+//     candidates, which is what it effectively got before.
 
-// gpuTypesData is the decode target for gpuTypesQuery.
-type gpuTypesData struct {
-	GPUTypes []struct {
-		ID             string `json:"id"`
-		DisplayName    string `json:"displayName"`
-		MemoryInGb     int    `json:"memoryInGb"`
-		SecureCloud    bool   `json:"secureCloud"`
-		CommunityCloud bool   `json:"communityCloud"`
-		LowestPrice    struct {
-			// UninterruptablePrice is the on-demand rate for the WHOLE shape at
-			// the requested gpuCount, not per card. Pointer because RunPod
-			// sends null for a type nobody is currently offering, and a plain
-			// float64 would turn "unavailable" into a free GPU.
-			UninterruptablePrice *float64 `json:"uninterruptablePrice"`
+// gpuCatalogResponse is GET /catalog/gpus with include=AVAILABILITY.
+type gpuCatalogResponse struct {
+	GPUs []gpuCatalogEntry `json:"gpus"`
+}
 
-			// MinimumBidPrice is the interruptible rate for the same shape.
-			// RunPod can reclaim a bid rental when someone outbids it, which
-			// is why it is cheaper. Pointer for the same reason as above.
-			MinimumBidPrice *float64 `json:"minimumBidPrice"`
+// gpuCatalogEntry is the subset of v2's GpuType this adapter reads.
+type gpuCatalogEntry struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Memory    int    `json:"memory"` // VRAM in GB
+	Secure    bool   `json:"secure"`
+	Community bool   `json:"community"`
+	// Price is the list price for a SINGLE card of this type, per cloud.
+	Price struct {
+		Secure    float64 `json:"secure"`
+		Community float64 `json:"community"`
+	} `json:"price"`
+	// Availability is NONE / LOW / MEDIUM / HIGH for the requested cloud,
+	// product and count. Absent or NONE means the type cannot be had at
+	// this width, and it must stay distinguishable from a present-but-low
+	// reading.
+	Availability string `json:"availability"`
+	// DataCenters lists only the datacenters offering this type in the
+	// requested configuration, each with its own availability. Omitted
+	// entirely when the configuration is unavailable everywhere.
+	DataCenters []catalogDatacenter `json:"dataCenters"`
+}
 
-			// StockStatus is "Low" / "Medium" / "High", or null when the type
-			// cannot be had at this width. Null is the availability signal, so
-			// it must stay distinguishable from a present-but-low reading.
-			StockStatus *string `json:"stockStatus"`
-		} `json:"lowestPrice"`
-	} `json:"gpuTypes"`
+// catalogDatacenter is DataCenterAvailability, shared by the GPU and CPU
+// catalogs.
+type catalogDatacenter struct {
+	ID           string `json:"id"`
+	Availability string `json:"availability"`
+}
 
+// datacenterCatalogResponse is GET /catalog/datacenters.
+type datacenterCatalogResponse struct {
 	DataCenters []struct {
-		ID       string `json:"id"`
-		Location string `json:"location"`
-		// StorageSupport is whether a network volume can live here, which
-		// decides where `iplane model pin` can stage a model.
-		StorageSupport bool `json:"storageSupport"`
-		// GPUAvailability is per width, the same gpuCount the price query
-		// asks about, so "available" means available AS the shape asked for.
-		GPUAvailability []struct {
-			GPUTypeID   string  `json:"gpuTypeId"`
-			Available   bool    `json:"available"`
-			StockStatus *string `json:"stockStatus"`
-		} `json:"gpuAvailability"`
+		ID string `json:"id"`
+		// NetworkVolumeTypes lists the volume tiers this datacenter
+		// supports. Empty means none, which decides where `iplane model
+		// pin` can stage a model.
+		NetworkVolumeTypes []string `json:"networkVolumeTypes"`
 	} `json:"dataCenters"`
 }
 
-// datacenter is one place a GPU type can be had, reduced to what a
-// candidate carries.
-type datacenter struct {
-	id      string
-	storage bool
-	stock   string
+// inStock reports whether a catalog availability level means "can be had".
+// NONE and an absent field both mean no.
+func inStock(level string) bool {
+	switch strings.ToUpper(level) {
+	case "LOW", "MEDIUM", "HIGH":
+		return true
+	}
+	return false
 }
 
-// datacentersByType inverts the datacenter list into a lookup from GPU type
-// to the places currently holding it at the requested width.
-//
-// Unavailable entries are dropped rather than recorded as "here but empty",
-// since a candidate an operator cannot act on is the thing this listing
-// exists to avoid.
-func datacentersByType(data gpuTypesData) map[string][]datacenter {
-	out := map[string][]datacenter{}
-	for _, dc := range data.DataCenters {
-		for _, g := range dc.GPUAvailability {
-			if !g.Available {
-				continue
-			}
-			stock := ""
-			if g.StockStatus != nil {
-				stock = *g.StockStatus
-			}
-			out[g.GPUTypeID] = append(out[g.GPUTypeID], datacenter{id: dc.ID, storage: dc.StorageSupport, stock: stock})
-		}
+// stockLabel renders a v2 availability level the way the stock_status attr
+// has always read ("Low", "Medium", "High"), so `iplane capacity` output
+// and the recorded capacity samples stay comparable across the migration.
+func stockLabel(level string) string {
+	l := strings.ToLower(level)
+	if l == "" {
+		return ""
 	}
-	return out
+	return strings.ToUpper(l[:1]) + l[1:]
+}
+
+// fetchGPUCatalog reads the GPU catalog with availability at gpuCount on
+// one cloud.
+func (p *Provider) fetchGPUCatalog(ctx context.Context, gpuCount int, cloud string) ([]gpuCatalogEntry, error) {
+	q := url.Values{}
+	q.Set("include", "AVAILABILITY")
+	q.Set("product", "POD")
+	q.Set("count", strconv.Itoa(gpuCount))
+	q.Set("cloud", cloud)
+	req, err := p.client.newReq("GET", "/catalog/gpus", q, nil)
+	if err != nil {
+		return nil, wrapErr("candidates", err)
+	}
+	resp, err := skhttp.Call[gpuCatalogResponse](ctx, req, p.client.callOpts()...)
+	if err != nil {
+		return nil, wrapErr("candidates", err)
+	}
+	return resp.GPUs, nil
+}
+
+// fetchDatacenterStorage maps each datacenter id to whether it can hold a
+// network volume.
+func (p *Provider) fetchDatacenterStorage(ctx context.Context) (map[string]bool, error) {
+	req, err := p.client.newReq("GET", "/catalog/datacenters", nil, nil)
+	if err != nil {
+		return nil, wrapErr("candidates", err)
+	}
+	resp, err := skhttp.Call[datacenterCatalogResponse](ctx, req, p.client.callOpts()...)
+	if err != nil {
+		return nil, wrapErr("candidates", err)
+	}
+	out := make(map[string]bool, len(resp.DataCenters))
+	for _, dc := range resp.DataCenters {
+		out[dc.ID] = len(dc.NetworkVolumeTypes) > 0
+	}
+	return out, nil
 }
 
 // Candidates satisfies provisioners.CandidateSource.
 //
-// RunPod sits between the other two implementations, which is why it was worth
-// probing rather than assuming. It is not a marketplace, so like Lambda there
-// is no host to identify and no offer to name. But unlike Lambda it publishes
-// no regions either: RunPod schedules wherever it has capacity, which is why
-// --dry-run already prints "(unpinned)" for it. So a RunPod candidate is a GPU
-// type and nothing more locational than that.
+// RunPod is not a marketplace, so like Lambda there is no host to identify
+// and no offer to name. A RunPod candidate is a GPU type in a datacenter,
+// at the live per-cloud price, with RunPod's stock reading. The price and
+// the stock are facts the static catalog cannot hold, and the stock level
+// is the closest thing any of our providers gives to a direct answer to
+// "can I actually have this right now".
 //
-// What it does publish, and what makes this worth a call, is a live price and
-// a stock level per width. Both are facts the static catalog cannot hold, and
-// the stock level is the closest thing any of our three providers gives to a
-// direct answer to "can I actually have this right now".
-//
-// The earlier note on CandidateSource guessed this would add nothing over the
-// static table. That was wrong, and measurably so.
+// Clouds are read in the order a create tries them (SECURE, then
+// COMMUNITY), and a type is reported on the first cloud that has it in
+// stock, at that cloud's price. That keeps a listing from quoting the
+// community price for a shape the create would place on secure.
 func (p *Provider) Candidates(ctx context.Context, reqs *provisionerv1.ResourceRequirements) ([]*provisioners.Candidate, error) {
 	if reqs == nil {
 		reqs = &provisionerv1.ResourceRequirements{}
@@ -141,17 +179,11 @@ func (p *Provider) Candidates(ctx context.Context, reqs *provisionerv1.ResourceR
 		gpuCount = 1
 	}
 
-	raw, err := p.gqlPost(ctx, fmt.Sprintf(gpuTypesQuery, gpuCount, gpuCount))
-	if err != nil {
-		return nil, provisioners.NewProviderError(p.Name(), "candidates", err, 0)
+	// No catalog read can answer a reclaimable request (see the header
+	// comment), so do not make one.
+	if reqs.GetReclaimPolicy() == provisionerv1.ReclaimPolicy_RECLAIM_POLICY_PREFERRED {
+		return nil, nil
 	}
-	var data gpuTypesData
-	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, provisioners.NewProviderError(p.Name(), "candidates",
-			fmt.Errorf("decode gpuTypes: %w", err), 0)
-	}
-
-	inDatacenters := datacentersByType(data)
 
 	// The same resolver the rent path uses decides which types are eligible,
 	// so a listing cannot offer something a create would then refuse. RunPod's
@@ -167,101 +199,39 @@ func (p *Provider) Candidates(ctx context.Context, reqs *provisionerv1.ResourceR
 		}
 	}
 
-	var out []*provisioners.Candidate
-	for _, g := range data.GPUTypes {
-		if !eligible[g.ID] {
-			continue
+	byCloud := map[string][]gpuCatalogEntry{}
+	for _, cloud := range anyCloud {
+		gpus, err := p.fetchGPUCatalog(ctx, gpuCount, cloud)
+		if err != nil {
+			return nil, err
 		}
-		// A null stock status means this type cannot be had at this width at
-		// all. Reporting it would put a row in front of an operator that they
-		// cannot act on, which is the same call Lambda's empty-capacity case
-		// makes.
-		if g.LowestPrice.StockStatus == nil || g.LowestPrice.UninterruptablePrice == nil {
-			continue
-		}
+		byCloud[cloud] = gpus
+	}
+	storage, err := p.fetchDatacenterStorage(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-		// The tier the operator asked for is the tier we price. A reclaimable
-		// request that came back quoted at the on-demand rate would look like
-		// the discount did not exist.
-		price, reclaimable := *g.LowestPrice.UninterruptablePrice, false
-		if reqs.GetReclaimPolicy() == provisionerv1.ReclaimPolicy_RECLAIM_POLICY_PREFERRED {
-			// A bid price that is not below the on-demand price is not a
-			// reclaimable tier, it is the same rental relabelled. Probing live
-			// on 2026-08-15, minimumBidPrice equalled uninterruptablePrice on
-			// all 38 available shapes, so in practice RunPod contributes
-			// nothing to a reclaimable search today.
-			//
-			// Reporting those as reclaimable would claim a discount that does
-			// not exist AND promise an interruptible rental this endpoint gives
-			// us no way to verify. Dropping them is the same call the resolver
-			// makes for an unknown fabric: we will not vouch for what the
-			// provider did not tell us.
-			if g.LowestPrice.MinimumBidPrice == nil ||
-				*g.LowestPrice.MinimumBidPrice >= *g.LowestPrice.UninterruptablePrice {
+	var out []*provisioners.Candidate
+	seen := map[string]bool{}
+	for _, cloud := range anyCloud {
+		for _, g := range byCloud[cloud] {
+			if !eligible[g.ID] || seen[g.ID] {
 				continue
 			}
-			price, reclaimable = *g.LowestPrice.MinimumBidPrice, true
-		}
-
-		// vramGb stays the live API figure, which is what an operator
-		// filters on. exactBytes comes off the catalog row instead,
-		// because the two want opposite error directions (#323).
-		var (
-			family     fabric.Family
-			vramGb     = g.MemoryInGb
-			exactBytes int64
-		)
-		if spec := LookupSKU(g.ID); spec != nil {
-			family = spec.Family
-			exactBytes = skucatalog.ExactVRAMBytes(spec.VRAMGb)
-		}
-
-		res := fabric.Resolve(fabric.Observation{Family: family})
-
-		// One row per datacenter holding this type, because that is the
-		// grain at which the answer is actionable: a volume lives in one,
-		// and Spawn can pin to one. A type no datacenter list mentions
-		// still gets a row with no region, since the datacenter view is
-		// extra information and losing it must not lose the candidate.
-		places := inDatacenters[g.ID]
-		if len(places) == 0 {
-			places = []datacenter{{}}
-		}
-		for _, dc := range places {
-			stock := *g.LowestPrice.StockStatus
-			if dc.stock != "" {
-				// The datacenter's own reading, since "Low here, High
-				// there" is exactly the distinction the type-level figure
-				// flattens.
-				stock = dc.stock
+			offered, perCard := g.Secure, g.Price.Secure
+			if cloud == cloudCommunity {
+				offered, perCard = g.Community, g.Price.Community
 			}
-			attrs := map[string]string{
-				"stock_status":    stock,
-				"secure_cloud":    strconv.FormatBool(g.SecureCloud),
-				"community_cloud": strconv.FormatBool(g.CommunityCloud),
+			// A type with no stock at this width, or no price on this cloud,
+			// is not something an operator can act on, which is the same
+			// call Lambda's empty-capacity case makes. It may still turn up
+			// on the next cloud.
+			if !offered || perCard <= 0 || !inStock(g.Availability) {
+				continue
 			}
-			if dc.id != "" {
-				// Whether a network volume can live here, which is what
-				// decides where a model can be staged for a warm deploy.
-				attrs["datacenter_storage"] = strconv.FormatBool(dc.storage)
-			}
-			out = append(out, &provisioners.Candidate{
-				// Still no HostID and no OfferID: RunPod is not a
-				// marketplace, so there is no host to name and nothing
-				// short-lived to identify.
-				Sku:              g.ID,
-				Region:           dc.id,
-				PriceUsdPerHour:  price,
-				Reclaimable:      reclaimable,
-				GpuCount:         int32(gpuCount),
-				VramGbPerGpu:     int32(vramGb),
-				VramBytesPerGpu:  exactBytes,
-				FabricScope:      res.Scope,
-				FabricSource:     res.Source,
-				FabricGbps:       res.Gbps,
-				FabricTechnology: res.Technology,
-				Attrs:            attrs,
-			})
+			seen[g.ID] = true
+			out = append(out, candidateRows(g, cloud, perCard*float64(gpuCount), gpuCount, storage)...)
 		}
 	}
 
@@ -269,4 +239,77 @@ func (p *Provider) Candidates(ctx context.Context, reqs *provisionerv1.ResourceR
 		return out[i].GetPriceUsdPerHour() < out[j].GetPriceUsdPerHour()
 	})
 	return out, nil
+}
+
+// candidateRows renders one in-stock GPU type as candidates: one row per
+// datacenter holding it, because that is the grain at which the answer is
+// actionable (a volume lives in one, and Spawn can pin to one). A type no
+// datacenter list mentions still gets a row with no region, since the
+// datacenter view is extra information and losing it must not lose the
+// candidate.
+func candidateRows(g gpuCatalogEntry, cloud string, price float64, gpuCount int, storage map[string]bool) []*provisioners.Candidate {
+	// vramGb stays the live API figure, which is what an operator
+	// filters on. exactBytes comes off the catalog row instead,
+	// because the two want opposite error directions (#323).
+	var (
+		family     fabric.Family
+		exactBytes int64
+	)
+	if spec := LookupSKU(g.ID); spec != nil {
+		family = spec.Family
+		exactBytes = skucatalog.ExactVRAMBytes(spec.VRAMGb)
+	}
+	res := fabric.Resolve(fabric.Observation{Family: family})
+
+	// Unavailable datacenters are dropped rather than recorded as "here
+	// but empty", since a candidate an operator cannot act on is the
+	// thing this listing exists to avoid.
+	var places []catalogDatacenter
+	for _, dc := range g.DataCenters {
+		if dc.ID != "" && inStock(dc.Availability) {
+			places = append(places, dc)
+		}
+	}
+	if len(places) == 0 {
+		places = []catalogDatacenter{{}}
+	}
+
+	rows := make([]*provisioners.Candidate, 0, len(places))
+	for _, dc := range places {
+		// The datacenter's own reading where there is one, since "Low
+		// here, High there" is exactly the distinction the type-level
+		// figure flattens.
+		stock := g.Availability
+		if dc.Availability != "" {
+			stock = dc.Availability
+		}
+		attrs := map[string]string{
+			"stock_status":    stockLabel(stock),
+			"cloud":           cloud,
+			"secure_cloud":    strconv.FormatBool(g.Secure),
+			"community_cloud": strconv.FormatBool(g.Community),
+		}
+		if dc.ID != "" {
+			// Whether a network volume can live here, which is what
+			// decides where a model can be staged for a warm deploy.
+			attrs["datacenter_storage"] = strconv.FormatBool(storage[dc.ID])
+		}
+		rows = append(rows, &provisioners.Candidate{
+			// Still no HostID and no OfferID: RunPod is not a
+			// marketplace, so there is no host to name and nothing
+			// short-lived to identify.
+			Sku:              g.ID,
+			Region:           dc.ID,
+			PriceUsdPerHour:  price,
+			GpuCount:         int32(gpuCount),
+			VramGbPerGpu:     int32(g.Memory),
+			VramBytesPerGpu:  exactBytes,
+			FabricScope:      res.Scope,
+			FabricSource:     res.Source,
+			FabricGbps:       res.Gbps,
+			FabricTechnology: res.Technology,
+			Attrs:            attrs,
+		})
+	}
+	return rows
 }
