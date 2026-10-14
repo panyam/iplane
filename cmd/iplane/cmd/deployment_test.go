@@ -295,7 +295,6 @@ func TestDeploy_RequiresInstanceImageModel(t *testing.T) {
 		// which instead requires --provider and a GPU-shape flag.
 		{"no-instance-no-provider", []string{"deploy", "my-llama", "--image", "x", "--model", "y"}, "--provider is required"},
 		{"no-instance-no-shape", []string{"deploy", "my-llama", "--image", "x", "--model", "y", "--provider", "runpod"}, "auto-provision requires"},
-		{"no-image", []string{"deploy", "my-llama", "--instance", "my-pod", "--model", "y"}, "--image is required"},
 		{"no-model", []string{"deploy", "my-llama", "--instance", "my-pod", "--image", "x"}, "--model is required"},
 	}
 	for _, tc := range cases {
@@ -308,6 +307,23 @@ func TestDeploy_RequiresInstanceImageModel(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// --image is optional: leaving it off runs the pinned engine, so a command
+// printed in the book does not have to repeat the version.
+func TestDeploy_ImageDefaultsToThePinnedEngine(t *testing.T) {
+	env := newDeploymentTestEnv(t)
+	out, err := runDeploymentCmd(t, env,
+		"deploy", "my-llama",
+		"--instance", "my-pod",
+		"--model", "Qwen/Qwen2.5-1.5B-Instruct",
+	)
+	if err != nil {
+		t.Fatalf("deploy without --image: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, defaultEngineImage) {
+		t.Errorf("deploy without --image should run %s; got:\n%s", defaultEngineImage, out)
 	}
 }
 

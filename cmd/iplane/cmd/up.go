@@ -69,7 +69,11 @@ var (
 	upTemperature   float64
 )
 
-const upDefaultImage = "vllm/vllm-openai:v0.27.1"
+// defaultEngineImage is the engine container `up` and `deployment deploy`
+// run when --image is not given. It is the vLLM release pinned in
+// pinned-versions.env (ENGINE_VERSION); TestDefaultEngineImageMatchesThePin
+// fails when the two drift.
+const defaultEngineImage = "vllm/vllm-openai:v0.27.1"
 
 var upCmd = &cobra.Command{
 	Use:   "up",
@@ -635,7 +639,7 @@ func init() {
 		`provider to provision on, e.g. runpod (default: `+EnvProvider+` env, else runpod)`)
 	f.StringVar(&upClass, "class", provisioners.GPUClassSmall,
 		`gpu class: small | medium | large | xlarge`)
-	f.StringVar(&upImage, "image", upDefaultImage,
+	f.StringVar(&upImage, "image", defaultEngineImage,
 		`engine container image`)
 	f.StringVar(&upRegion, "region", "",
 		`region hint for the provider (optional)`)
