@@ -156,11 +156,12 @@ derived:
 
   # Fitted and extrapolated. Printable only with the word "predicts" attached.
   - id: fit-8k
-    status: measured
+    status: predicted
     from: glm52-8k
     check: literal
     value: 25.18
     label: "asymptote of cost/M = 94.43/B + 25.18, six points, two parameters, 4.2% max error"
+    basis: "Fitted asymptote at B -> infinity, not an observation; the cheapest measured point is cost-floor-8k. Was 'measured' until the 2026-10 technical review."
 
   - id: cost-8k-b64
     status: predicted
@@ -305,6 +306,202 @@ derived:
 # Every rental, including the ones that produced nothing. Ch 14 wants failed
 # attempts counted in the cost series, and that number is only recoverable if
 # it is written down while it is still known.
+
+  # Per-request API comparison (2026-10 technical review). Every entry is a
+  # list price or arithmetic on measured columns, so none is "measured".
+  - id: api-price-glm-in
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 0.75
+    label: "DeepInfra GLM-5.2, $ per million input tokens"
+    basis: "DeepInfra list price read 2026-10-13 from api.deepinfra.com/models/zai-org/GLM-5.2 (cents_per_input_token 7.5e-05). The API also reported discount 0.25 with no end date."
+
+  - id: api-price-glm-out
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 2.4
+    label: "DeepInfra GLM-5.2, $ per million output tokens"
+    basis: "DeepInfra list price read 2026-10-13 from api.deepinfra.com/models/zai-org/GLM-5.2 (cents_per_output_token 0.00024)."
+
+  - id: api-price-k3-in
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 2.85
+    label: "DeepInfra Kimi K3, $ per million input tokens"
+    basis: "DeepInfra list price read 2026-10-13 from api.deepinfra.com/models/moonshotai/Kimi-K3."
+
+  - id: api-price-k3-out
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 14.25
+    label: "DeepInfra Kimi K3, $ per million output tokens"
+    basis: "DeepInfra list price read 2026-10-13 from api.deepinfra.com/models/moonshotai/Kimi-K3."
+
+  - id: in-out-ratio-8k
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 23.5
+    label: "prompt tokens per output token at 8k, at the cheapest point"
+    basis: "8192 / (194821 completion tokens / 558 successes) = 23.46, N=32 row. A ratio of artifact columns with no runnable check, so predicted rather than measured; truncated requests would lower it slightly."
+
+  - id: in-out-ratio-32k
+    status: predicted
+    from: glm52-32k
+    check: literal
+    value: 88.4
+    label: "prompt tokens per output token at 32k, at the cheapest point"
+    basis: "32000 / (38738 / 107) = 88.39, N=8 row. A ratio of artifact columns with no runnable check, so predicted rather than measured; truncated requests would lower it slightly."
+
+  - id: in-out-ratio-120k
+    status: predicted
+    from: glm52-120k
+    check: literal
+    value: 358
+    label: "prompt tokens per output token at 120k, at the cheapest point"
+    basis: "120000 / (10714 / 32) = 358.4, N=1 row. A ratio of artifact columns with no runnable check, so predicted rather than measured; truncated requests would lower it slightly."
+
+  - id: blended-api-8k
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 20.00
+    label: "GLM-5.2 API cost per million output tokens at 8k, input priced in"
+    basis: "in-out-ratio * api-price-glm-in + api-price-glm-out: 23.46*0.75 + 2.40"
+
+  - id: blended-api-32k
+    status: predicted
+    from: glm52-32k
+    check: literal
+    value: 68.69
+    label: "GLM-5.2 API cost per million output tokens at 32k, input priced in"
+    basis: "in-out-ratio * api-price-glm-in + api-price-glm-out: 88.39*0.75 + 2.40"
+
+  - id: blended-api-120k
+    status: predicted
+    from: glm52-120k
+    check: literal
+    value: 271.21
+    label: "GLM-5.2 API cost per million output tokens at 120k, input priced in"
+    basis: "in-out-ratio * api-price-glm-in + api-price-glm-out: 358.41*0.75 + 2.40"
+
+  - id: self-over-api-8k
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 1.41
+    label: "self-hosted cost floor at 8k as a multiple of the blended GLM-5.2 API cost"
+    basis: "28.13 / 20.00"
+
+  - id: self-over-api-32k
+    status: predicted
+    from: glm52-32k
+    check: literal
+    value: 1.60
+    label: "self-hosted cost floor at 32k as a multiple of the blended GLM-5.2 API cost"
+    basis: "109.72 / 68.69"
+
+  - id: self-over-api-120k
+    status: predicted
+    from: glm52-120k
+    check: literal
+    value: 1.81
+    label: "self-hosted cost floor at 120k as a multiple of the blended GLM-5.2 API cost"
+    basis: "490.95 / 271.21"
+
+  - id: fit-over-api-8k
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 1.26
+    label: "the 8k fitted floor as a multiple of the blended GLM-5.2 API cost"
+    basis: "25.18 / 20.00"
+
+  - id: blended-k3-8k
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 81.12
+    label: "Kimi K3 API cost per million output tokens at 8k, input priced in"
+    basis: "23.46*2.85 + 14.25"
+
+  - id: k3-over-self-8k
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 2.88
+    label: "blended Kimi K3 API cost at 8k as a multiple of the self-hosted floor"
+    basis: "81.12 / 28.13"
+
+  - id: k3-over-self-32k
+    status: predicted
+    from: glm52-32k
+    check: literal
+    value: 2.43
+    label: "blended Kimi K3 API cost at 32k as a multiple of the self-hosted floor"
+    basis: "(88.39*2.85 + 14.25 = 266.16) / 109.72"
+
+  - id: k3-over-self-120k
+    status: predicted
+    from: glm52-120k
+    check: literal
+    value: 2.11
+    label: "blended Kimi K3 API cost at 120k as a multiple of the self-hosted floor"
+    basis: "(358.41*2.85 + 14.25 = 1035.72) / 490.95"
+
+  - id: self-over-cheapest-api-8k
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 4.13
+    label: "self-hosted 8k floor as a multiple of DeepSeek-V3.1 API cost, input priced in"
+    basis: "DeepInfra deepseek-ai/DeepSeek-V3.1 $0.25 in / $0.95 out, read 2026-10-13: 23.46*0.25 + 0.95 = 6.82; 28.13 / 6.82"
+
+  - id: self-over-cheapest-api-120k
+    status: predicted
+    from: glm52-120k
+    check: literal
+    value: 5.42
+    label: "self-hosted 120k floor as a multiple of DeepSeek-V3.1 API cost, input priced in"
+    basis: "358.41*0.25 + 0.95 = 90.55; 490.95 / 90.55"
+
+  - id: prefill-share-8k
+    status: predicted
+    from: glm52-8k
+    check: literal
+    value: 78
+    label: "percent of engine time spent in prefill at 8k, N=32"
+    basis: "0.930 req/s at N=32 x 0.836 s single-request TTFT (N=1 row) = 0.777. Treats N=1 TTFT as the prefill cost of one prompt."
+
+  - id: kv-sessions-32k
+    status: predicted
+    from: glm52-32k
+    check: literal
+    value: 17
+    label: "32k sessions whose KV cache fits on 8xH200 TP8"
+    basis: "internal/vrambudget MaxSessions for GLM-5.2 AWQ, TP8, BF16 latent replicated per rank, utilization 0.9, 32.5k tokens per session"
+
+  - id: kv-sessions-120k
+    status: predicted
+    from: glm52-120k
+    check: literal
+    value: 4
+    label: "120k sessions whose KV cache fits on 8xH200 TP8"
+    basis: "same model as kv-sessions-32k at 120.5k tokens per session"
+
+  - id: ttft-jump-32k
+    status: predicted
+    from: glm52-32k
+    check: literal
+    value: 9.2
+    label: "32k median TTFT at N=32 as a multiple of N=16"
+    basis: "32645 ms / 3551 ms = 9.19, ttft_p50_ms column. Ratio of artifact columns with no runnable check, so predicted."
+
+
 runs:
   - id: run-20260826-172159
     status: measured
