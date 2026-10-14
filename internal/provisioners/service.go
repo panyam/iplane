@@ -1333,6 +1333,10 @@ func (s *Service) CreateDeployment(ctx context.Context, req *provisionerv1.Creat
 		}
 	}
 
+	// Size the container disk from the checkpoint, now that it is known
+	// whether the weights come off a volume instead.
+	s.sizeDiskForCheckpoint(ctx, req)
+
 	// v0.2 ch7-beat3.10 (#143 + refactor): auto-provision flows
 	// through replicas_spec. createMultiReplicaDeployment branches
 	// off here so the single-instance pinned path below stays
