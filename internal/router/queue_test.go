@@ -355,3 +355,59 @@ func TestRouter_Shutdown_DrainsInFlight(t *testing.T) {
 	}
 }
 
+
+// A request waiting on a full in-flight cap when the router shuts down
+// gets a prompt 503 rather than hanging until the client times out.
+func TestRouter_Shutdown_RejectsRequestWaitingOnSlot(t *testing.T) {
+	hold := make(chan struct{})
+	arrived := make(chan struct{}, 4)
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		arrived <- struct{}{}
+		<-hold
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer engine.Close()
+
+	r := New(&fakeDeploymentClient{
+		describe: func(*provisionerv1.DescribeDeploymentRequest) (*provisionerv1.DescribeDeploymentResponse, error) {
+			return &provisionerv1.DescribeDeploymentResponse{Deployment: &provisionerv1.Deployment{
+				Id:             "my-llama",
+				State:          provisionerv1.DeploymentState_DEPLOYMENT_STATE_RUNNING,
+				EngineEndpoint: engine.URL,
+			}}, nil
+		},
+	}, nil, WithQueue(1, 4), WithInFlightCap(1))
+	r.Start(context.Background())
+	srv := httptest.NewServer(serveThroughMux(r))
+	defer srv.Close()
+	defer close(hold) // before srv.Close, which waits for the first request
+
+	post := func(out chan<- *http.Response) {
+		resp, err := http.Post(srv.URL+"/v1/my-llama/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			out <- nil
+			return
+		}
+		out <- resp
+	}
+	first, second := make(chan *http.Response, 1), make(chan *http.Response, 1)
+	go post(first)
+	<-arrived
+	go post(second)
+	time.Sleep(50 * time.Millisecond) // second is popped and parked on the cap
+
+	go r.Shutdown()
+	select {
+	case resp := <-second:
+		if resp == nil {
+			t.Fatal("waiting request failed at the transport")
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", resp.StatusCode)
+		}
+		assertOpenAIErrorBody(t, resp, "router_shutting_down")
+	case <-time.After(2 * time.Second):
+		t.Fatal("request waiting on the in-flight cap hung through Shutdown")
+	}
+}

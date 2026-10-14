@@ -57,6 +57,22 @@ type Entry interface {
 	Priority() string
 }
 
+// Rejecter is the optional Entry side-band for entries the scheduler
+// accepted but will never hand to the handler, because Stop ran while
+// they were queued or waiting for an in-flight slot. Whoever is
+// blocked on the entry (the router's HTTP handler) needs to hear about
+// it, or it waits forever. Reject is called at most once, never for an
+// entry the handler saw, with ErrSchedulerClosed.
+type Rejecter interface {
+	Reject(err error)
+}
+
+func reject(e Entry) {
+	if r, ok := e.(Rejecter); ok {
+		r.Reject(ErrSchedulerClosed)
+	}
+}
+
 // HandlerFunc does the actual work for one dispatched entry --
 // typically "forward to engine and write response back to the
 // caller." The scheduler invokes it on its worker goroutine; the
