@@ -38,7 +38,7 @@ func cpURL() string { return envOr("CP_URL", "http://localhost:8080") }
 
 // modelID is the model identifier used in completion/chat requests.
 // Must match a model the backend (vLLM) is currently serving.
-func modelID() string { return envOr("MODEL", "Qwen/Qwen3.5-8B-Instruct") }
+func modelID() string { return envOr("MODEL", "Qwen/Qwen3-8B") }
 
 // httpClient is shared across tests with a generous timeout for slow
 // generations. The control plane's WriteTimeout is 10 minutes; we cap
