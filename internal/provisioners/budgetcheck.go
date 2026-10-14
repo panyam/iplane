@@ -139,9 +139,12 @@ func (s *Service) deployCardCapacity(req *provisionerv1.CreateDeploymentRequest)
 
 // logBudgetSkip records why the check declined to speak. A silent skip
 // and a silent pass look identical to an operator who expected a
-// pre-flight, so the reason is the whole value of the line.
+// pre-flight, so the reason is the whole value of the line. Warn rather
+// than Info, because a check that did not run is the thing an operator
+// reading the log for "did it pass" needs to find (the GLM-5.2 deploys
+// skipped it on every run, and it read as a pass).
 func (s *Service) logBudgetSkip(deploymentID, reason string) {
-	slog.Info("skipping the VRAM pre-flight", "deployment", deploymentID, "reason", reason)
+	slog.Warn("the VRAM pre-flight did not run", "deployment", deploymentID, "reason", reason)
 }
 
 // largestBudgetTerm names the claim carrying most of the working set,
