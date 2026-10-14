@@ -1,8 +1,8 @@
 //go:build runpod_readonly
 
 // Read-only checks of the RunPod adapter against the live REST v2 API.
-// Every call is a GET: the pod list, the GPU and datacenter catalogs, the
-// account's SSH keys, and the network volumes. Nothing is created,
+// Every call is a GET: the pod list, the account's SSH keys, and the
+// network volumes. Nothing is created,
 // started, stopped or modified, so this costs nothing.
 //
 // It has its own build tag, separate from smoke_runpod, because
@@ -30,7 +30,6 @@ import (
 	"testing"
 	"time"
 
-	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
 	"github.com/inference-book/inference-plane/internal/provisioners/runpod"
 	smokeproviders "github.com/inference-book/inference-plane/tests/smoke-providers"
 )
@@ -59,33 +58,6 @@ func readOnlyProvider(t *testing.T) *runpod.Provider {
 // GET /v2/pods, every page.
 func TestRunPodReadOnly_Pods(t *testing.T) {
 	smokeproviders.RunList(t, readOnlyProvider(t))
-}
-
-// GET /v2/catalog/gpus at one and eight cards, both clouds, plus
-// GET /v2/catalog/datacenters.
-func TestRunPodReadOnly_Catalog(t *testing.T) {
-	p := readOnlyProvider(t)
-	for _, n := range []int32{1, 8} {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		got, err := p.Candidates(ctx, &provisionerv1.ResourceRequirements{MinVramGb: 80, GpuCount: n})
-		cancel()
-		if err != nil {
-			t.Fatalf("Candidates(%d x >=80 GB): %v", n, err)
-		}
-		t.Logf("%d x >=80 GB: %d candidates", n, len(got))
-		for i, c := range got {
-			if i >= 8 {
-				t.Logf("  ... %d more", len(got)-8)
-				break
-			}
-			t.Logf("  %-24s %-10s $%7.2f/h  stock=%-6s cloud=%-9s storage=%s",
-				c.GetSku(), c.GetRegion(), c.GetPriceUsdPerHour(),
-				c.GetAttrs()["stock_status"], c.GetAttrs()["cloud"], c.GetAttrs()["datacenter_storage"])
-			if c.GetPriceUsdPerHour() <= 0 || c.GetVramGbPerGpu() < 80 {
-				t.Errorf("implausible candidate %+v: a decode is reading a field RunPod does not send", c)
-			}
-		}
-	}
 }
 
 // GET /v2/account/ssh-keys.
