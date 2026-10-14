@@ -2,6 +2,7 @@ package provisioners_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
@@ -84,5 +85,40 @@ func TestRecordCarriesOperatorIntent(t *testing.T) {
 	}
 	if !sawTP {
 		t.Errorf("engine_args = %v, want the translated tensor-parallel flag", dep.GetEngineArgs())
+	}
+}
+
+// A deployment naming a credential the daemon cannot read is refused at create
+// time and registers nothing, so the router never holds a record it would
+// have to forward without the credential.
+func TestCreateDeploymentRefusesAnUnsetUpstreamCredential(t *testing.T) {
+	store, err := file.Open(t.TempDir(), "op")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	svc := provisioners.New(
+		[]provisioners.Provider{local.New(), external.New()}, store, "op",
+		provisioners.WithModelStore(nil),
+	)
+
+	_, err = svc.CreateDeployment(context.Background(), &provisionerv1.CreateDeploymentRequest{
+		Wait: true,
+		Deployment: &provisionerv1.Deployment{
+			Id:           "hosted",
+			Model:        "mock/mock",
+			UpstreamAuth: &provisionerv1.UpstreamAuth{ValueEnv: "TEST_RECORD_KEY_DEFINITELY_UNSET"},
+		},
+		ReplicasSpec: []*provisionerv1.ReplicaSpec{{
+			Provider:       provisioners.ProviderExternal,
+			Replicas:       1,
+			EngineEndpoint: "https://api.example.com/v1",
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "TEST_RECORD_KEY_DEFINITELY_UNSET") {
+		t.Fatalf("CreateDeployment err = %v, want a refusal naming the variable", err)
+	}
+	if _, err := svc.DescribeDeployment(context.Background(),
+		&provisionerv1.DescribeDeploymentRequest{Id: "hosted"}); err == nil {
+		t.Error("a refused deployment was registered anyway")
 	}
 }

@@ -1,7 +1,7 @@
 package router
 
 import (
-	"net/http"
+	"strings"
 	"testing"
 
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
@@ -12,74 +12,52 @@ import (
 // goes to the state file and to every DescribeDeployment response.
 func TestUpstreamAuthResolvesFromTheEnvironment(t *testing.T) {
 	t.Setenv("TEST_UPSTREAM_KEY", "sk-secret")
-	h := http.Header{}
 
-	applyUpstreamAuth(h, &provisionerv1.UpstreamAuth{
+	h, v, err := resolveUpstreamAuth(&provisionerv1.UpstreamAuth{
 		Header: "Authorization", ValueEnv: "TEST_UPSTREAM_KEY", ValuePrefix: "Bearer ",
 	})
 
-	if got := h.Get("Authorization"); got != "Bearer sk-secret" {
-		t.Errorf("Authorization = %q, want the prefixed credential", got)
-	}
-}
-
-// Set, not Add, and applied after the inbound headers are copied. Otherwise a
-// caller could smuggle their own Authorization through to a paid upstream by
-// sending one to us.
-func TestUpstreamAuthOverwritesACallerSuppliedHeader(t *testing.T) {
-	t.Setenv("TEST_UPSTREAM_KEY", "ours")
-	h := http.Header{}
-	h.Set("Authorization", "Bearer theirs")
-
-	applyUpstreamAuth(h, &provisionerv1.UpstreamAuth{
-		Header: "Authorization", ValueEnv: "TEST_UPSTREAM_KEY", ValuePrefix: "Bearer ",
-	})
-
-	if got := h.Values("Authorization"); len(got) != 1 || got[0] != "Bearer ours" {
-		t.Errorf("Authorization = %v, want exactly our credential", got)
+	if err != nil || h != "Authorization" || v != "Bearer sk-secret" {
+		t.Errorf("got (%q, %q, %v), want the prefixed credential in Authorization", h, v, err)
 	}
 }
 
 // Everything iplane provisions itself is reachable because we rented it. A
-// deployment with no credential must get no header at all, not an empty one.
+// deployment with no credential gets no header at all, not an empty one.
 func TestUpstreamAuthAbsentForOwnedEngines(t *testing.T) {
-	h := http.Header{}
-
-	applyUpstreamAuth(h, nil)
-
-	if _, present := h["Authorization"]; present {
-		t.Errorf("set a header for a deployment that named no credential: %v", h)
+	if h, v, err := resolveUpstreamAuth(nil); h != "" || v != "" || err != nil {
+		t.Errorf("got (%q, %q, %v) for a deployment that named no credential", h, v, err)
 	}
 }
 
-// A credential rotated out from under a running router should surface as a 401
-// from the upstream, which is accurate and debuggable, rather than as a
-// synthetic error from us. The mistake is caught at deploy time instead.
-func TestUpstreamAuthSkipsAMissingVariableRatherThanSendingEmpty(t *testing.T) {
-	h := http.Header{}
-
-	applyUpstreamAuth(h, &provisionerv1.UpstreamAuth{
+// A variable that has gone missing since deploy time is an error, never a
+// silent skip: skipping used to leave the caller's own Authorization in the
+// outbound request.
+func TestUpstreamAuthMissingVariableIsAnError(t *testing.T) {
+	_, _, err := resolveUpstreamAuth(&provisionerv1.UpstreamAuth{
 		Header: "Authorization", ValueEnv: "TEST_UPSTREAM_DEFINITELY_UNSET", ValuePrefix: "Bearer ",
 	})
+	if err == nil || !strings.Contains(err.Error(), "TEST_UPSTREAM_DEFINITELY_UNSET") {
+		t.Errorf("err = %v, want an error naming the variable", err)
+	}
+}
 
-	if _, present := h["Authorization"]; present {
-		t.Errorf("sent a header built from an unset variable: %v", h)
+// A record with a header but no variable is misconfigured, not unauthenticated.
+func TestUpstreamAuthWithoutAVariableIsAnError(t *testing.T) {
+	if _, _, err := resolveUpstreamAuth(&provisionerv1.UpstreamAuth{Header: "Authorization"}); err == nil {
+		t.Error("accepted an upstream auth with no value_env")
 	}
 }
 
 // Some gateways want the bare token under their own header name.
 func TestUpstreamAuthSupportsANonBearerHeader(t *testing.T) {
 	t.Setenv("TEST_UPSTREAM_KEY", "raw-token")
-	h := http.Header{}
 
-	applyUpstreamAuth(h, &provisionerv1.UpstreamAuth{
+	h, v, err := resolveUpstreamAuth(&provisionerv1.UpstreamAuth{
 		Header: "X-Api-Key", ValueEnv: "TEST_UPSTREAM_KEY",
 	})
 
-	if got := h.Get("X-Api-Key"); got != "raw-token" {
-		t.Errorf("X-Api-Key = %q, want the bare token with no prefix", got)
-	}
-	if h.Get("Authorization") != "" {
-		t.Error("also set Authorization, which the operator did not ask for")
+	if err != nil || h != "X-Api-Key" || v != "raw-token" {
+		t.Errorf("got (%q, %q, %v), want the bare token in X-Api-Key", h, v, err)
 	}
 }

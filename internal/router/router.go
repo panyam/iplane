@@ -37,6 +37,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -756,12 +757,24 @@ func (r *Router) proxyTo(w http.ResponseWriter, req *http.Request, dep *provisio
 		return
 	}
 
+	// Resolve the outbound credential before anything is dialed. A deployment
+	// that names a credential the daemon cannot read fails closed here: the
+	// alternative is an unauthenticated (or, before this check, a
+	// caller-authenticated) request to a paid third party.
+	authHeader, authValue, err := resolveUpstreamAuth(dep.GetUpstreamAuth())
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("deployment %q: %v", dep.GetId(), err), "upstream_auth_unavailable")
+		return
+	}
+
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
+			tail := pr.In.URL.Path
 			if stripDeployPrefix {
-				pr.Out.URL.Path = openAITail(pr.In.URL.Path)
+				tail = openAITail(tail)
 			}
+			pr.Out.URL.Path = joinUpstreamPath(target.Path, tail)
 			pr.Out.URL.RawPath = ""
 			pr.Out.Host = target.Host
 			// v0.2 ch7-beat2.2: strip the iplane-internal tenant
@@ -785,16 +798,16 @@ func (r *Router) proxyTo(w http.ResponseWriter, req *http.Request, dep *provisio
 				pr.In.Context(),
 				propagation.HeaderCarrier(pr.Out.Header),
 			)
-			// Ch 11: present a credential to engines that sit behind an
-			// authenticating gateway (a hosted OpenAI-compatible API, or
-			// an operator's own vLLM behind an ingress that checks a
-			// token). Unset for anything iplane provisioned, which is
-			// reachable because we rented it.
-			//
-			// Set rather than Add, and after the header copy above, so a
-			// caller cannot smuggle their own Authorization through to a
-			// paid upstream by sending one to us.
-			applyUpstreamAuth(pr.Out.Header, dep.GetUpstreamAuth())
+			// Ch 11: whatever credential the caller presented to us is
+			// theirs, and it never travels past the router. Then present
+			// the deployment's own credential, if it names one, to an
+			// engine behind an authenticating gateway (a hosted
+			// OpenAI-compatible API, or an operator's vLLM behind an
+			// ingress that checks a token).
+			stripCallerCredentials(pr.Out.Header)
+			if authHeader != "" {
+				pr.Out.Header.Set(authHeader, authValue)
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("upstream engine call failed: %v", err), "engine_unreachable")
@@ -858,27 +871,81 @@ func writeOpenAIError(w http.ResponseWriter, status int, msg, errType string) {
 	})
 }
 
-// applyUpstreamAuth sets the outbound credential for an attached engine.
+// callerCredentialHeaders are request headers that carry a client's own
+// credential. The router is the trust boundary: a client authenticates to
+// iplane (or to nothing), and the engine is reached with the deployment's
+// credential or none. Forwarding these would hand a client's key to whoever
+// runs the upstream, which for a hosted API is a third party.
+// Proxy-Authorization is hop-by-hop and already dropped by ReverseProxy; it is
+// listed so the rule does not depend on that.
+var callerCredentialHeaders = []string{
+	"Authorization",
+	"Proxy-Authorization",
+	"Cookie",
+	"X-Api-Key",
+	"Api-Key",
+	"X-Goog-Api-Key",
+	"Ocp-Apim-Subscription-Key",
+}
+
+func stripCallerCredentials(h http.Header) {
+	for _, k := range callerCredentialHeaders {
+		h.Del(k)
+	}
+}
+
+// resolveUpstreamAuth returns the header and value the router presents to an
+// attached engine, or an empty header when the deployment names no
+// credential.
 //
 // The Deployment carries the NAME of an environment variable, never the
 // secret, so the credential is resolved here in the daemon's own process and
 // never lands in the state file or in a DescribeDeployment response.
 //
-// A missing variable is silently skipped rather than failed. The alternative
-// is a router that starts rejecting live traffic because a credential was
-// rotated out from under it, and a 401 from the upstream is both more
-// accurate and more debuggable than a synthetic error from us. The mistake
-// surfaces at deploy time, where CreateDeployment can check the variable
-// exists before anything is registered.
-func applyUpstreamAuth(h http.Header, auth *provisionerv1.UpstreamAuth) {
-	if auth.GetHeader() == "" || auth.GetValueEnv() == "" {
-		return
+// CreateDeployment already refuses a variable that is unset at deploy time.
+// It can still go missing later (a daemon restarted without it, a rotation
+// that unset it), and then the request fails with an error naming the
+// variable. It is never forwarded without the credential: doing that used to
+// leave the caller's own Authorization in place, sending it to the provider.
+func resolveUpstreamAuth(auth *provisionerv1.UpstreamAuth) (header, value string, err error) {
+	if auth == nil {
+		return "", "", nil
+	}
+	if auth.GetValueEnv() == "" {
+		if auth.GetHeader() == "" && auth.GetValuePrefix() == "" {
+			return "", "", nil
+		}
+		return "", "", fmt.Errorf("upstream auth is configured without value_env; refusing to forward")
 	}
 	secret := os.Getenv(auth.GetValueEnv())
 	if secret == "" {
-		return
+		return "", "", fmt.Errorf("upstream credential $%s is empty or unset in the daemon's environment; refusing to forward without it", auth.GetValueEnv())
 	}
-	h.Set(auth.GetHeader(), auth.GetValuePrefix()+secret)
+	header = auth.GetHeader()
+	prefix := auth.GetValuePrefix()
+	if header == "" {
+		header, prefix = "Authorization", "Bearer "
+	}
+	return header, prefix + secret, nil
+}
+
+// joinUpstreamPath appends an OpenAI-shaped request path ("/v1/...") to an
+// engine endpoint's base path. Hosted APIs document their base URL with the
+// version on the end (https://api.example.com/v1, .../openai/v1), and the
+// request path carries it too, so a base ending in /v1 absorbs the tail's
+// leading /v1 rather than producing /v1/v1/....
+func joinUpstreamPath(base, tail string) string {
+	base = strings.TrimRight(base, "/")
+	if strings.HasSuffix(base, "/v1") && (tail == "/v1" || strings.HasPrefix(tail, "/v1/")) {
+		tail = tail[len("/v1"):]
+	}
+	if tail == "" {
+		if base == "" {
+			return "/"
+		}
+		return base
+	}
+	return base + tail
 }
 
 // WithCostRecorder attaches the cost recorder so served time is
