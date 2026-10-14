@@ -47,7 +47,7 @@ sequenceDiagram
      queue:
        servicers: 2      # MUST be > 0; default 0 disables the scheduler
        capacity: 256
-       in_flight_cap: 4  # caps concurrent engine in-flight per deployment
+       in_flight_cap: 4  # caps concurrent engine in-flight per replica
        # Optional per-tenant weights for richer fair-share story:
        # tenant_weights:
        #   alice: 1
