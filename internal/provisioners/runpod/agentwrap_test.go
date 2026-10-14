@@ -114,15 +114,15 @@ func TestBuildEnginePodRequestLeavesEntrypointAloneByDefault(t *testing.T) {
 		Hardware: &provisionerv1.Hardware{GpuSku: "NVIDIA A100 80GB PCIe", GpuCount: 1},
 	}
 
-	req, err := buildEnginePodRequest(dep, inst)
+	req, _, err := buildEnginePodRequest(dep, inst)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req.DockerEntrypoint != nil {
-		t.Errorf("DockerEntrypoint = %v, want nil for a deployment with no agent configured", req.DockerEntrypoint)
+	if req.Entrypoint != nil {
+		t.Errorf("Entrypoint = %v, want nil for a deployment with no agent configured", req.Entrypoint)
 	}
 	// The engine args are untouched either way.
-	if !strings.Contains(strings.Join(req.DockerStartCmd, " "), "--model meta-llama/Llama-3.1-8B") {
-		t.Errorf("DockerStartCmd = %v", req.DockerStartCmd)
+	if !strings.Contains(strings.Join(req.Cmd, " "), "--model meta-llama/Llama-3.1-8B") {
+		t.Errorf("Cmd = %v", req.Cmd)
 	}
 }

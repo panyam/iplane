@@ -2,87 +2,116 @@ package runpod
 
 import (
 	"context"
-	"encoding/json"
-	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
 )
 
-// gpuTypesFixture mirrors the live payload shape, verified against the real
-// GraphQL API on 2026-08-15. The nulls are the important part: RunPod sends
-// them for a type nobody is offering at the requested width, and they are the
-// availability signal rather than a malformed response.
-const gpuTypesFixture = `{"gpuTypes":[
- {"id":"NVIDIA A100 80GB PCIe","displayName":"A100 PCIe","memoryInGb":80,
-  "secureCloud":true,"communityCloud":true,
-  "lowestPrice":{"uninterruptablePrice":1.19,"stockStatus":"Low"}},
- {"id":"NVIDIA A100-SXM4-80GB","displayName":"A100 SXM","memoryInGb":80,
-  "secureCloud":true,"communityCloud":true,
-  "lowestPrice":{"uninterruptablePrice":1.39,"stockStatus":"Medium"}},
- {"id":"NVIDIA H100 PCIe","displayName":"H100 PCIe","memoryInGb":80,
-  "secureCloud":true,"communityCloud":true,
-  "lowestPrice":{"uninterruptablePrice":null,"stockStatus":null}},
- {"id":"NVIDIA L4","displayName":"L4","memoryInGb":24,
-  "secureCloud":true,"communityCloud":false,
-  "lowestPrice":{"uninterruptablePrice":0.43,"stockStatus":"High"}},
- {"id":"NVIDIA H100 80GB HBM3","displayName":"H100 SXM","memoryInGb":80,
-  "secureCloud":true,"communityCloud":true,
-  "lowestPrice":{"uninterruptablePrice":2.69,"stockStatus":null}},
- {"id":"NVIDIA H100 NVL","displayName":"H100 NVL","memoryInGb":94,
-  "secureCloud":true,"communityCloud":true,
-  "lowestPrice":{"uninterruptablePrice":null,"stockStatus":"Low"}}
-],
-"dataCenters":[
- {"id":"AP-IN-1","location":"India","storageSupport":false,
-  "gpuAvailability":[{"gpuTypeId":"NVIDIA A100-SXM4-80GB","available":true,"stockStatus":"Low"}]},
- {"id":"EUR-IS-1","location":"Europe","storageSupport":true,
-  "gpuAvailability":[{"gpuTypeId":"NVIDIA A100-SXM4-80GB","available":true,"stockStatus":"Medium"},
-                     {"gpuTypeId":"NVIDIA L4","available":false,"stockStatus":null}]},
- {"id":"US-MO-1","location":"United States","storageSupport":false,
-  "gpuAvailability":[{"gpuTypeId":"NVIDIA L4","available":true,"stockStatus":"High"}]}
+// secureGPUsFixture is GET /v2/catalog/gpus?include=AVAILABILITY&cloud=SECURE
+// in the documented GpuType shape. Prices are per card. Each unavailable
+// row is unavailable a different way, so a check on one signal cannot pass
+// for a check on all of them.
+const secureGPUsFixture = `{"gpus":[
+ {"id":"NVIDIA A100 80GB PCIe","name":"A100 PCIe","pool":"AMPERE_80","manufacturer":"NVIDIA","memory":80,
+  "secure":true,"community":true,"price":{"secure":1.19,"community":0.89},"maxCount":{"secure":8,"community":4},
+  "availability":"LOW","dataCenters":[{"id":"US-KS-2","name":"US Kansas 2","availability":"LOW"}]},
+ {"id":"NVIDIA A100-SXM4-80GB","name":"A100 SXM","pool":"AMPERE_80","manufacturer":"NVIDIA","memory":80,
+  "secure":true,"community":true,"price":{"secure":1.39,"community":1.09},"maxCount":{"secure":8,"community":8},
+  "availability":"MEDIUM","dataCenters":[{"id":"AP-IN-1","name":"India 1","availability":"LOW"},
+                                         {"id":"EUR-IS-1","name":"Iceland 1","availability":"MEDIUM"}]},
+ {"id":"NVIDIA H100 PCIe","name":"H100 PCIe","pool":"HOPPER_80","manufacturer":"NVIDIA","memory":80,
+  "secure":true,"community":true,"price":{"secure":2.39,"community":1.99},"maxCount":{"secure":8,"community":8},
+  "availability":"NONE"},
+ {"id":"NVIDIA L4","name":"L4","pool":"ADA_24","manufacturer":"NVIDIA","memory":24,
+  "secure":true,"community":false,"price":{"secure":0.43,"community":0},"maxCount":{"secure":8,"community":0},
+  "availability":"HIGH","dataCenters":[{"id":"EUR-IS-1","name":"Iceland 1","availability":"NONE"},
+                                       {"id":"US-MO-1","name":"Missouri 1","availability":"HIGH"}]},
+ {"id":"NVIDIA H100 80GB HBM3","name":"H100 SXM","pool":"HOPPER_80","manufacturer":"NVIDIA","memory":80,
+  "secure":true,"community":true,"price":{"secure":2.69,"community":2.39},"maxCount":{"secure":8,"community":8}},
+ {"id":"NVIDIA H100 NVL","name":"H100 NVL","pool":null,"manufacturer":"NVIDIA","memory":94,
+  "secure":true,"community":false,"price":{"secure":0,"community":0},"maxCount":{"secure":8,"community":0},
+  "availability":"LOW"},
+ {"id":"NVIDIA GeForce RTX 4090","name":"RTX 4090","pool":"ADA_24","manufacturer":"NVIDIA","memory":24,
+  "secure":true,"community":true,"price":{"secure":0.44,"community":0.31},"maxCount":{"secure":8,"community":4},
+  "availability":"NONE"}
 ]}`
 
-// candidateProvider serves the fixture for any gpuTypes query and records
-// every query body, so a test can assert on what actually went over the wire.
-func candidateProvider(t *testing.T, queries *[]string) *Provider {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var env struct {
-			Query string `json:"query"`
-		}
-		_ = json.Unmarshal(body, &env)
-		if queries != nil {
-			*queries = append(*queries, env.Query)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":` + gpuTypesFixture + `}`))
-	}))
-	t.Cleanup(srv.Close)
-	rt := &rewriteTransport{toHost: strings.TrimPrefix(srv.URL, "http://")}
-	return New(NewClient("test-api-key", WithHTTPClient(&http.Client{Transport: rt})))
+// communityGPUsFixture is the same read at cloud=COMMUNITY. The 4090 is
+// only in stock here; the A100 SXM is in stock on both and must be
+// reported once, on SECURE, where a create would put it first.
+const communityGPUsFixture = `{"gpus":[
+ {"id":"NVIDIA A100-SXM4-80GB","name":"A100 SXM","memory":80,"secure":true,"community":true,
+  "price":{"secure":1.39,"community":1.09},"maxCount":{"secure":8,"community":8},
+  "availability":"HIGH","dataCenters":[{"id":"US-TX-1","name":"Texas 1","availability":"HIGH"}]},
+ {"id":"NVIDIA H100 PCIe","name":"H100 PCIe","memory":80,"secure":true,"community":true,
+  "price":{"secure":2.39,"community":1.99},"maxCount":{"secure":8,"community":8},"availability":"NONE"},
+ {"id":"NVIDIA GeForce RTX 4090","name":"RTX 4090","memory":24,"secure":true,"community":true,
+  "price":{"secure":0.44,"community":0.31},"maxCount":{"secure":8,"community":4},
+  "availability":"HIGH","dataCenters":[{"id":"US-TX-1","name":"Texas 1","availability":"HIGH"}]}
+]}`
+
+// datacentersFixture is GET /v2/catalog/datacenters. networkVolumeTypes
+// empty means the datacenter holds no volumes.
+const datacentersFixture = `{"dataCenters":[
+ {"id":"AP-IN-1","name":"India 1","region":"ASIA","networkVolumeTypes":[],"compliance":[],"globalNetwork":false},
+ {"id":"EUR-IS-1","name":"Iceland 1","region":"EUROPE","networkVolumeTypes":["STANDARD"],"compliance":["GDPR"],"globalNetwork":false},
+ {"id":"US-MO-1","name":"Missouri 1","region":"NORTH_AMERICA","networkVolumeTypes":[],"compliance":[],"globalNetwork":false},
+ {"id":"US-KS-2","name":"US Kansas 2","region":"NORTH_AMERICA","networkVolumeTypes":["STANDARD","HIGH_PERFORMANCE"],"compliance":[],"globalNetwork":true},
+ {"id":"US-TX-1","name":"Texas 1","region":"NORTH_AMERICA","networkVolumeTypes":["STANDARD"],"compliance":[],"globalNetwork":false}
+]}`
+
+// catalogRequest is one request the catalog fake saw.
+type catalogRequest struct {
+	method, path string
+	query        url.Values
 }
 
-// A null stock status means the type cannot be had at this width. It is the
-// one thing RunPod publishes that a catalog cannot, so dropping it on the
-// floor would leave this call buying nothing over --dry-run.
+// catalogServer answers the two catalog reads from the given bodies and
+// records every request.
+func catalogServer(t *testing.T, secure, community, datacenters string, seen *[]catalogRequest) *Provider {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if seen != nil {
+			*seen = append(*seen, catalogRequest{r.Method, r.URL.Path, r.URL.Query()})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v2/catalog/gpus" && r.URL.Query().Get("cloud") == "COMMUNITY":
+			_, _ = w.Write([]byte(community))
+		case r.URL.Path == "/v2/catalog/gpus":
+			_, _ = w.Write([]byte(secure))
+		case r.URL.Path == "/v2/catalog/datacenters":
+			_, _ = w.Write([]byte(datacenters))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return New(NewClient("test-api-key", WithBaseURL(srv.URL+"/v2"), WithHTTPClient(srv.Client())))
+}
+
+func candidateProvider(t *testing.T, seen *[]catalogRequest) *Provider {
+	return catalogServer(t, secureGPUsFixture, communityGPUsFixture, datacentersFixture, seen)
+}
+
+// A type with no stock at the width, no availability reading, or no price
+// on the cloud cannot be had, and putting it in front of an operator gives
+// them a row they cannot act on.
 func TestCandidatesSkipUnavailableTypes(t *testing.T) {
 	got, err := candidateProvider(t, nil).Candidates(context.Background(),
 		&provisionerv1.ResourceRequirements{MinVramGb: 80})
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
-
-	// Three ways to be unavailable, and each has to be caught on its own.
-	// Both-null is the shape RunPod actually sends; the two half-null rows
-	// exist so a check on one field cannot pass for a check on both.
 	unavailable := map[string]string{
-		"NVIDIA H100 PCIe":      "both fields null",
-		"NVIDIA H100 80GB HBM3": "priced but no stock reported",
+		"NVIDIA H100 PCIe":      "availability NONE on both clouds",
+		"NVIDIA H100 80GB HBM3": "no availability reported",
 		"NVIDIA H100 NVL":       "stock reported but no price",
 	}
 	for _, c := range got {
@@ -99,35 +128,45 @@ func TestCandidatesSkipUnavailableTypes(t *testing.T) {
 // 35 of 48 types were obtainable as one GPU and 11 of 48 as eight, so a query
 // that hardcoded the count would report capacity that is not there.
 func TestCandidatesAskAtTheRequestedWidth(t *testing.T) {
-	var queries []string
-	p := candidateProvider(t, &queries)
+	var seen []catalogRequest
+	p := candidateProvider(t, &seen)
 
 	if _, err := p.Candidates(context.Background(),
 		&provisionerv1.ResourceRequirements{MinVramGb: 80, GpuCount: 8}); err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
 
-	if len(queries) != 1 {
-		t.Fatalf("got %d queries, want 1", len(queries))
+	clouds := map[string]bool{}
+	for _, r := range seen {
+		if r.path != "/v2/catalog/gpus" {
+			continue
+		}
+		clouds[r.query.Get("cloud")] = true
+		if r.query.Get("count") != "8" {
+			t.Errorf("gpu catalog read at count=%q, want 8", r.query.Get("count"))
+		}
+		// count and cloud are only honoured alongside include=AVAILABILITY,
+		// which in turn requires a product.
+		if r.query.Get("include") != "AVAILABILITY" || r.query.Get("product") != "POD" {
+			t.Errorf("gpu catalog query %v lacks include=AVAILABILITY&product=POD", r.query)
+		}
 	}
-	if !strings.Contains(queries[0], "gpuCount:8") {
-		t.Errorf("query did not ask at the requested width:\n%s", queries[0])
+	if !clouds[cloudSecure] || !clouds[cloudCommunity] || len(clouds) != 2 {
+		t.Errorf("clouds read = %v, want SECURE and COMMUNITY", clouds)
 	}
 }
 
 // An absent gpu_count means one, matching the rest of the provisioning path.
-// Sending gpuCount:0 would ask RunPod a question about nothing.
 func TestCandidatesDefaultToOneGPU(t *testing.T) {
-	var queries []string
-	p := candidateProvider(t, &queries)
-
-	if _, err := p.Candidates(context.Background(),
+	var seen []catalogRequest
+	if _, err := candidateProvider(t, &seen).Candidates(context.Background(),
 		&provisionerv1.ResourceRequirements{MinVramGb: 80}); err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
-
-	if !strings.Contains(queries[0], "gpuCount:1") {
-		t.Errorf("query did not default to a single GPU:\n%s", queries[0])
+	for _, r := range seen {
+		if r.path == "/v2/catalog/gpus" && r.query.Get("count") != "1" {
+			t.Errorf("gpu catalog read at count=%q, want 1", r.query.Get("count"))
+		}
 	}
 }
 
@@ -140,7 +179,6 @@ func TestCandidatesFilterThroughTheSameResolverAsSpawn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
-
 	for _, c := range got {
 		if LookupSKU(c.GetSku()) == nil {
 			t.Errorf("candidate %q is not in our catalog", c.GetSku())
@@ -151,9 +189,8 @@ func TestCandidatesFilterThroughTheSameResolverAsSpawn(t *testing.T) {
 	}
 }
 
-// RunPod rents a GPU type and picks the datacenter itself, so there is no host
-// to identify, no offer to name, and no region to record. Empty is the honest
-// answer; a synthesized id would point at something that was never a place.
+// RunPod is not a marketplace: no host to identify, no offer to name. The
+// region is a datacenter the payload named, or nothing.
 func TestCandidatesLeaveHostAndOfferEmpty(t *testing.T) {
 	got, err := candidateProvider(t, nil).Candidates(context.Background(),
 		&provisionerv1.ResourceRequirements{Sku: "NVIDIA A100-SXM4-80GB"})
@@ -163,16 +200,14 @@ func TestCandidatesLeaveHostAndOfferEmpty(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatal("no candidates")
 	}
-	known := map[string]bool{"AP-IN-1": true, "EUR-IS-1": true, "US-MO-1": true}
+	known := map[string]bool{"AP-IN-1": true, "EUR-IS-1": true}
 	for _, c := range got {
 		if c.GetHostId() != "" || c.GetOfferId() != "" {
 			t.Errorf("HostID=%q OfferID=%q, want both empty on a provider with neither concept",
 				c.GetHostId(), c.GetOfferId())
 		}
-		// Region is no longer empty, but it is still never invented: it is a
-		// datacenter id the payload named, or nothing.
 		if r := c.GetRegion(); r != "" && !known[r] {
-			t.Errorf("region = %q, which no datacenter in the payload named", r)
+			t.Errorf("region = %q, which the SECURE payload did not name for this type", r)
 		}
 	}
 }
@@ -188,11 +223,9 @@ func TestCandidatesUseTheLivePriceNotTheCatalog(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatal("no candidates")
 	}
-	// Every row, since the price is a property of the type and one row per
-	// datacenter must not let a stale figure in through a side door.
 	for _, c := range got {
 		if c.GetPriceUsdPerHour() != 1.39 {
-			t.Errorf("%s price = %v, want the live 1.39", c.GetRegion(), c.GetPriceUsdPerHour())
+			t.Errorf("%s price = %v, want the live secure 1.39", c.GetRegion(), c.GetPriceUsdPerHour())
 		}
 	}
 	if catalog := LookupSKU("NVIDIA A100-SXM4-80GB"); catalog != nil &&
@@ -201,31 +234,47 @@ func TestCandidatesUseTheLivePriceNotTheCatalog(t *testing.T) {
 	}
 }
 
-// Read-only by contract. GraphQL puts reads and writes on one endpoint, so
-// unlike the REST adapters there is no URL to assert on: the query text is the
-// only thing separating a listing from a mutation.
-func TestCandidatesNeverMutate(t *testing.T) {
-	var queries []string
-	p := candidateProvider(t, &queries)
-
-	if _, err := p.Candidates(context.Background(), &provisionerv1.ResourceRequirements{}); err != nil {
+// v2 lists a price for ONE card; the rate for a pod is that times the
+// count. GraphQL priced the whole shape, so forgetting the multiply would
+// quote an eight-card pod at a single card's rate.
+func TestCandidatesPriceTheWholeShape(t *testing.T) {
+	got, err := candidateProvider(t, nil).Candidates(context.Background(),
+		&provisionerv1.ResourceRequirements{Sku: "NVIDIA A100-SXM4-80GB", GpuCount: 8})
+	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
-
-	for _, q := range queries {
-		if strings.Contains(q, "mutation") || strings.Contains(q, "updateUserSettings") {
-			t.Errorf("Candidates sent a mutation:\n%s", q)
+	if len(got) == 0 {
+		t.Fatal("no candidates")
+	}
+	for _, c := range got {
+		if math.Abs(c.GetPriceUsdPerHour()-8*1.39) > 1e-9 {
+			t.Errorf("%s price = %v, want 8 x 1.39", c.GetRegion(), c.GetPriceUsdPerHour())
 		}
-		if !strings.HasPrefix(strings.TrimSpace(q), "query") {
-			t.Errorf("Candidates sent something that is not a query:\n%s", q)
+		if c.GetGpuCount() != 8 {
+			t.Errorf("gpu count = %d, want 8", c.GetGpuCount())
 		}
 	}
 }
 
-// The stock level is the strongest signal RunPod gives, and it stays in Attrs
-// rather than becoming a typed field because no second provider reports
-// anything comparable. Lambda's availability is binary and expressed by
-// omission; Vast has no notion of stock at all.
+// Read-only by contract, and on REST the method says so.
+func TestCandidatesNeverMutate(t *testing.T) {
+	var seen []catalogRequest
+	if _, err := candidateProvider(t, &seen).Candidates(context.Background(), &provisionerv1.ResourceRequirements{}); err != nil {
+		t.Fatalf("Candidates: %v", err)
+	}
+	if len(seen) == 0 {
+		t.Fatal("no requests made")
+	}
+	for _, r := range seen {
+		if r.method != http.MethodGet || !strings.HasPrefix(r.path, "/v2/catalog/") {
+			t.Errorf("Candidates sent %s %s; only catalog GETs are allowed", r.method, r.path)
+		}
+	}
+}
+
+// The stock level stays in Attrs, per datacenter, in the casing the attr
+// always had ("Low" rather than v2's "LOW"), so capacity samples recorded
+// before and after the migration compare.
 func TestCandidatesCarryStockStatusAsAProviderAttr(t *testing.T) {
 	got, err := candidateProvider(t, nil).Candidates(context.Background(),
 		&provisionerv1.ResourceRequirements{Sku: "NVIDIA A100-SXM4-80GB"})
@@ -239,52 +288,32 @@ func TestCandidatesCarryStockStatusAsAProviderAttr(t *testing.T) {
 		} else {
 			byRegion[c.GetRegion()] = s
 		}
+		if c.GetAttrs()["cloud"] != cloudSecure {
+			t.Errorf("%s cloud attr = %q, want SECURE", c.GetRegion(), c.GetAttrs()["cloud"])
+		}
 	}
-	// Per datacenter rather than one figure for the type. "Low here, Medium
-	// there" is the distinction the type-level reading flattens, and it is
-	// the one that decides where to send a deploy.
 	if byRegion["AP-IN-1"] != "Low" || byRegion["EUR-IS-1"] != "Medium" {
 		t.Errorf("stock by datacenter = %v, want AP-IN-1 Low and EUR-IS-1 Medium", byRegion)
 	}
 }
 
-// A bid price that is not below the on-demand price is not a reclaimable tier,
-// it is the same rental relabelled. Probing live, RunPod reported the two as
-// equal on all 38 available shapes, so reporting them as reclaimable would
-// claim a discount that does not exist and promise an interruptible rental
-// this endpoint gives no way to verify.
-func TestCandidatesRejectABidThatIsNotADiscount(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"gpuTypes":[
-		  {"id":"NVIDIA A100-SXM4-80GB","memoryInGb":80,
-		   "lowestPrice":{"uninterruptablePrice":1.39,"minimumBidPrice":1.39,"stockStatus":"Low"}},
-		  {"id":"NVIDIA A100 80GB PCIe","memoryInGb":80,
-		   "lowestPrice":{"uninterruptablePrice":1.19,"minimumBidPrice":0.40,"stockStatus":"Low"}}
-		]}}`))
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	rt := &rewriteTransport{toHost: strings.TrimPrefix(srv.URL, "http://")}
-	p := New(NewClient("k", WithHTTPClient(&http.Client{Transport: rt})))
-
-	got, err := p.Candidates(context.Background(), &provisionerv1.ResourceRequirements{
+// v2 publishes no bid price and the create takes no interruptible flag, so
+// there is nothing RunPod can offer a reclaimable search, and asking the
+// catalog would only spend a request to find that out.
+func TestCandidatesOfferNothingReclaimable(t *testing.T) {
+	var seen []catalogRequest
+	got, err := candidateProvider(t, &seen).Candidates(context.Background(), &provisionerv1.ResourceRequirements{
 		MinVramGb:     80,
 		ReclaimPolicy: provisionerv1.ReclaimPolicy_RECLAIM_POLICY_PREFERRED,
 	})
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
-
-	if len(got) != 1 {
-		t.Fatalf("got %d candidates, want only the one with a real discount: %+v", len(got), got)
+	if len(got) != 0 {
+		t.Errorf("got %d reclaimable candidates, want none: %+v", len(got), got)
 	}
-	if got[0].GetSku() != "NVIDIA A100 80GB PCIe" || got[0].GetPriceUsdPerHour() != 0.40 {
-		t.Errorf("got %s at $%.2f, want the PCIe shape at its 0.40 bid", got[0].GetSku(), got[0].GetPriceUsdPerHour())
-	}
-	if !got[0].GetReclaimable() {
-		t.Error("the surviving candidate was not marked reclaimable")
+	if len(seen) != 0 {
+		t.Errorf("made %d catalog reads for a question the catalog cannot answer", len(seen))
 	}
 }
 
@@ -292,9 +321,8 @@ func TestCandidatesRejectABidThatIsNotADiscount(t *testing.T) {
 // A100 80GB, so drift shows up here rather than as a silent disagreement
 // between vendors about one physical card (#323).
 func TestCandidatesCarryExactCardCapacity(t *testing.T) {
-	p := candidateProvider(t, nil)
-
-	got, err := p.Candidates(context.Background(), &provisionerv1.ResourceRequirements{Sku: "NVIDIA A100-SXM4-80GB"})
+	got, err := candidateProvider(t, nil).Candidates(context.Background(),
+		&provisionerv1.ResourceRequirements{Sku: "NVIDIA A100-SXM4-80GB"})
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
@@ -310,83 +338,71 @@ func TestCandidatesCarryExactCardCapacity(t *testing.T) {
 	}
 }
 
-// RunPod does publish where its capacity is, and this adapter used to say
-// it did not. `dataCenters { gpuAvailability(gpuCount) }` answers it per
-// width, and the datacenter is decision-relevant rather than trivia: a
-// network volume is locked to one, so a model staged in the wrong place is
-// a warm cache no deploy can mount.
-//
-// Found the hard way while planning #358. RunPod had eight-card capacity in
-// exactly one datacenter and that one supports no volumes, which `iplane
-// capacity` had no way to say.
+// The datacenter is decision-relevant rather than trivia: a network volume
+// is locked to one, so a model staged in the wrong place is a warm cache no
+// deploy can mount. Found the hard way while planning #358, when RunPod's
+// only eight-card capacity was in a datacenter that holds no volumes.
 func TestCandidatesReportWhereTheCapacityIs(t *testing.T) {
 	got, err := candidateProvider(t, nil).Candidates(context.Background(),
 		&provisionerv1.ResourceRequirements{Sku: "NVIDIA A100-SXM4-80GB", GpuCount: 8})
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
-
 	byRegion := map[string]*provisionerv1.Candidate{}
 	for _, c := range got {
 		byRegion[c.GetRegion()] = c
 	}
-	if len(byRegion) != 2 {
-		t.Fatalf("want one candidate per datacenter holding the type, got %d: %+v", len(got), got)
+	// One row per SECURE datacenter. The COMMUNITY reading (US-TX-1) is not
+	// a second listing of the same type.
+	if len(byRegion) != 2 || byRegion["AP-IN-1"] == nil || byRegion["EUR-IS-1"] == nil {
+		t.Fatalf("want one candidate per secure datacenter holding the type, got %+v", got)
 	}
-	for _, want := range []string{"AP-IN-1", "EUR-IS-1"} {
-		if byRegion[want] == nil {
-			t.Errorf("no candidate for %s: %+v", want, got)
-		}
-	}
-	// The datacenter a volume can live in is the whole reason to report it.
 	if s := byRegion["EUR-IS-1"].GetAttrs()["datacenter_storage"]; s != "true" {
 		t.Errorf("EUR-IS-1 storage attr = %q, want true", s)
 	}
 	if s := byRegion["AP-IN-1"].GetAttrs()["datacenter_storage"]; s != "false" {
 		t.Errorf("AP-IN-1 storage attr = %q, want false", s)
 	}
-	// Stock is per datacenter, not one figure for the type.
-	if s := byRegion["EUR-IS-1"].GetAttrs()["stock_status"]; s != "Medium" {
-		t.Errorf("EUR-IS-1 stock = %q, want the datacenter's own Medium", s)
-	}
 }
 
-// A datacenter that lists the type as unavailable is not a place you can
-// have it. Reporting it would put a row in front of an operator that they
-// cannot act on, which is the same call the null-stock filter makes one
-// level up.
+// A datacenter that lists the type with availability NONE is not a place
+// you can have it.
 func TestCandidatesSkipDatacentersThatHaveNone(t *testing.T) {
 	got, err := candidateProvider(t, nil).Candidates(context.Background(),
 		&provisionerv1.ResourceRequirements{Sku: "NVIDIA L4"})
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
-	for _, c := range got {
-		// The fixture has EUR-IS-1 holding an L4 entry with available:false.
-		if c.GetRegion() == "EUR-IS-1" {
-			t.Errorf("offered an L4 in a datacenter that reported none: %+v", c)
-		}
-	}
 	if len(got) != 1 || got[0].GetRegion() != "US-MO-1" {
 		t.Errorf("want the one datacenter that has it, got %+v", got)
 	}
 }
 
+// A type out of stock on SECURE but in stock on COMMUNITY is a candidate,
+// at the community price, because the deploy path tries COMMUNITY next.
+func TestCandidatesFallBackToTheCommunityCloud(t *testing.T) {
+	got, err := candidateProvider(t, nil).Candidates(context.Background(),
+		&provisionerv1.ResourceRequirements{Sku: "NVIDIA GeForce RTX 4090"})
+	if err != nil {
+		t.Fatalf("Candidates: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d candidates, want the 4090 once: %+v", len(got), got)
+	}
+	c := got[0]
+	if c.GetPriceUsdPerHour() != 0.31 || c.GetAttrs()["cloud"] != cloudCommunity || c.GetRegion() != "US-TX-1" {
+		t.Errorf("got %s at $%v on %s in %s, want COMMUNITY 0.31 in US-TX-1",
+			c.GetSku(), c.GetPriceUsdPerHour(), c.GetAttrs()["cloud"], c.GetRegion())
+	}
+}
+
 // The datacenter view is extra information, so losing it must not lose the
-// candidate. A type the price query says is available, that no datacenter
-// list mentions, is still available: RunPod schedules it somewhere.
+// candidate.
 func TestCandidatesSurviveADatacenterListThatSaysNothing(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"gpuTypes":[
-		 {"id":"NVIDIA A100-SXM4-80GB","displayName":"A100 SXM","memoryInGb":80,
-		  "secureCloud":true,"communityCloud":true,
-		  "lowestPrice":{"uninterruptablePrice":1.39,"stockStatus":"Medium"}}],
-		 "dataCenters":[]}}`))
-	}))
-	t.Cleanup(srv.Close)
-	rt := &rewriteTransport{toHost: strings.TrimPrefix(srv.URL, "http://")}
-	p := New(NewClient("test-api-key", WithHTTPClient(&http.Client{Transport: rt})))
+	p := catalogServer(t,
+		`{"gpus":[{"id":"NVIDIA A100-SXM4-80GB","name":"A100 SXM","memory":80,"secure":true,"community":true,
+		  "price":{"secure":1.39,"community":1.09},"maxCount":{"secure":8,"community":8},"availability":"MEDIUM"}]}`,
+		`{"gpus":[]}`, `{"dataCenters":[]}`, nil)
 
 	got, err := p.Candidates(context.Background(),
 		&provisionerv1.ResourceRequirements{Sku: "NVIDIA A100-SXM4-80GB", GpuCount: 8})
@@ -398,5 +414,39 @@ func TestCandidatesSurviveADatacenterListThatSaysNothing(t *testing.T) {
 	}
 	if r := got[0].GetRegion(); r != "" {
 		t.Errorf("region = %q, want empty when no datacenter named it", r)
+	}
+	if got[0].GetAttrs()["stock_status"] != "Medium" {
+		t.Errorf("stock = %q, want the type-level Medium", got[0].GetAttrs()["stock_status"])
+	}
+}
+
+// The response example RunPod's OpenAPI publishes for GET /v2/catalog/gpus,
+// verbatim. If the decode drifts from the vendor's shape, this is where it
+// shows, rather than in a fixture written to match the decoder.
+func TestCandidatesParseTheDocumentedCatalogExample(t *testing.T) {
+	const documented = `{"gpus": [{"id": "NVIDIA GeForce RTX 4090", "name": "RTX 4090", "pool": "ADA_24", "manufacturer": "NVIDIA", "memory": 24, "secure": true, "community": true, "price": {"secure": 0.44, "community": 0.31, "serverless": 1.1}, "maxCount": {"secure": 8, "community": 4}, "availability": "HIGH", "dataCenters": [{"id": "US-KS-2", "name": "US Kansas 2", "availability": "HIGH"}]}]}`
+	p := catalogServer(t, documented, `{"gpus":[]}`, datacentersFixture, nil)
+
+	got, err := p.Candidates(context.Background(),
+		&provisionerv1.ResourceRequirements{Sku: "NVIDIA GeForce RTX 4090"})
+	if err != nil {
+		t.Fatalf("Candidates: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d candidates, want 1: %+v", len(got), got)
+	}
+	c := got[0]
+	if c.GetSku() != "NVIDIA GeForce RTX 4090" || c.GetRegion() != "US-KS-2" ||
+		c.GetPriceUsdPerHour() != 0.44 || c.GetVramGbPerGpu() != 24 {
+		t.Errorf("parsed %+v, want the 4090 in US-KS-2 at 0.44 with 24 GB", c)
+	}
+	want := map[string]string{
+		"stock_status": "High", "cloud": "SECURE", "secure_cloud": "true",
+		"community_cloud": "true", "datacenter_storage": "true",
+	}
+	for k, v := range want {
+		if c.GetAttrs()[k] != v {
+			t.Errorf("attr %s = %q, want %q", k, c.GetAttrs()[k], v)
+		}
 	}
 }

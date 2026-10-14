@@ -10,27 +10,26 @@ import (
 	"github.com/inference-book/inference-plane/internal/provisioners/providertest"
 )
 
-// podListProvider builds a Provider whose /pods answers from `pods` and
-// honours ?name= server-side, the way RunPod does. The shared harness's
-// respond callback cannot see the query, and the query is half of what this
-// file is testing: the suite has to exercise the server-side narrowing and
-// the client-side match together, or one hides a gap in the other.
+// podListProvider builds a Provider whose GET /v2/pods answers from `pods`
+// in v2's wrapped shape. v2 has no server-side name filter (v1 honoured
+// ?name=), so the fake ignores any query and returns the whole account:
+// the client-side match is the only narrowing there is, which is exactly
+// what the conformance suite has to hold to the contract.
 func podListProvider(t *testing.T, pods map[string]string) *Provider {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		want := r.URL.Query().Get("name")
+		if r.URL.Path != "/v2/pods" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
 		rows := make([]string, 0, len(pods))
 		for id, name := range pods {
-			if want != "" && name != want {
-				continue
-			}
-			rows = append(rows, `{"id":"`+id+`","name":"`+name+`","desiredStatus":"RUNNING"}`)
+			rows = append(rows, `{"id":"`+id+`","name":"`+name+`","status":"RUNNING"}`)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte("[" + strings.Join(rows, ",") + "]"))
+		_, _ = w.Write([]byte(`{"pods":[` + strings.Join(rows, ",") + `],"pagination":{"nextCursor":null,"hasNextPage":false}}`))
 	}))
 	t.Cleanup(srv.Close)
-	return New(NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client())))
+	return New(NewClient("test-api-key", WithBaseURL(srv.URL+"/v2"), WithHTTPClient(srv.Client())))
 }
 
 // RunPod encodes iplane-id in the pod name and nothing else, so the shared

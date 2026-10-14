@@ -62,38 +62,42 @@ func proxyServer(t *testing.T, status int) string {
 func TestDeploy_HappyPath_GoesToRUNNING(t *testing.T) {
 	proxyURL := proxyServer(t, http.StatusOK)
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
+		if method == "POST" && path == "/v2/pods" {
 			var req createPodRequest
 			_ = json.Unmarshal(body, &req)
-			if req.ImageName != "vllm/vllm-openai:v0.7.0" {
-				t.Errorf("POST body imageName = %q, want vllm/vllm-openai:v0.7.0", req.ImageName)
+			if req.Image != "vllm/vllm-openai:v0.7.0" {
+				t.Errorf("POST body image = %q, want vllm/vllm-openai:v0.7.0", req.Image)
 			}
-			joined := strings.Join(req.DockerStartCmd, " ")
+			if req.GPU == nil || req.GPU.ID != "NVIDIA RTX A5000" || req.GPU.Count != 1 {
+				t.Errorf("POST body gpu = %+v, want the instance's A5000 x1", req.GPU)
+			}
+			if req.Cloud != cloudSecure {
+				t.Errorf("first placement cloud = %q, want SECURE", req.Cloud)
+			}
+			joined := strings.Join(req.Cmd, " ")
 			if !strings.Contains(joined, "--model Qwen/Qwen2.5-1.5B-Instruct") {
-				t.Errorf("dockerStartCmd missing --model: %v", req.DockerStartCmd)
+				t.Errorf("cmd missing --model: %v", req.Cmd)
 			}
 			if !strings.Contains(joined, "--gpu-memory-utilization") {
-				t.Errorf("dockerStartCmd missing operator engine-args: %v", req.DockerStartCmd)
+				t.Errorf("cmd missing operator engine-args: %v", req.Cmd)
 			}
 			if req.Env["HF_HUB_DISABLE_TELEMETRY"] != "1" {
 				t.Errorf("env not propagated: %+v", req.Env)
 			}
-			// Default deploy is proxy-only: no publicIp, no /tcp ports
+			// Default deploy is proxy-only: no SSH keys, no /tcp ports
 			// other than the engine /http.
-			if req.SupportPublicIP {
-				t.Errorf("SupportPublicIP=true on default deploy; want false (proxy-only is the cost-aware default)")
+			if req.StartSSH {
+				t.Errorf("startSsh=true on default deploy; want false (proxy-only is the cost-aware default)")
 			}
 			if len(req.Ports) != 1 || req.Ports[0] != "8000/http" {
 				t.Errorf("Ports = %v, want [8000/http]", req.Ports)
 			}
-			return 201, `{"id":"rp-engine-1","desiredStatus":"RUNNING"}`
+			return 201, `{"id":"rp-engine-1","status":"PROVISIONING"}`
 		}
 		t.Errorf("unexpected %s %s", method, path)
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client,
 		WithSSHReadyWait(2*time.Second, 5*time.Millisecond),
 		WithProxyBaseURL(proxyURL),
@@ -118,19 +122,19 @@ func TestDeploy_Mounts_AttachNetworkVolume(t *testing.T) {
 	proxyURL := proxyServer(t, http.StatusOK)
 	var gotVolumeID, gotMountPath string
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
+		if method == "POST" && path == "/v2/pods" {
 			var req createPodRequest
 			_ = json.Unmarshal(body, &req)
-			gotVolumeID = req.NetworkVolumeID
-			gotMountPath = req.VolumeMountPath
-			return 201, `{"id":"rp-engine-1","desiredStatus":"RUNNING"}`
+			if req.Mounts != nil && len(req.Mounts.Network) == 1 {
+				gotVolumeID = req.Mounts.Network[0].VolumeID
+				gotMountPath = req.Mounts.Network[0].Path
+			}
+			return 201, `{"id":"rp-engine-1","status":"PROVISIONING"}`
 		}
 		t.Errorf("unexpected %s %s", method, path)
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client, WithSSHReadyWait(2*time.Second, 5*time.Millisecond), WithProxyBaseURL(proxyURL))
 
 	dep := okDep()
@@ -143,10 +147,10 @@ func TestDeploy_Mounts_AttachNetworkVolume(t *testing.T) {
 		t.Fatalf("Deploy: %v", err)
 	}
 	if gotVolumeID != "vol-abc123" {
-		t.Errorf("networkVolumeId = %q, want vol-abc123", gotVolumeID)
+		t.Errorf("mounts.network[0].volumeId = %q, want vol-abc123", gotVolumeID)
 	}
 	if gotMountPath != "/models" {
-		t.Errorf("volumeMountPath = %q, want /models", gotMountPath)
+		t.Errorf("mounts.network[0].path = %q, want /models", gotMountPath)
 	}
 }
 
@@ -154,38 +158,36 @@ func TestDeploy_NoMounts_LeavesNetworkVolumeUnset(t *testing.T) {
 	proxyURL := proxyServer(t, http.StatusOK)
 	var gotVolumeID string
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
+		if method == "POST" && path == "/v2/pods" {
 			var req createPodRequest
 			_ = json.Unmarshal(body, &req)
-			gotVolumeID = req.NetworkVolumeID
-			return 201, `{"id":"rp-engine-1","desiredStatus":"RUNNING"}`
+			if req.Mounts != nil {
+				gotVolumeID = "mounts present"
+			}
+			return 201, `{"id":"rp-engine-1","status":"PROVISIONING"}`
 		}
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client, WithSSHReadyWait(2*time.Second, 5*time.Millisecond), WithProxyBaseURL(proxyURL))
 
 	if err := p.Deploy(context.Background(), okDep(), okInst(), nil, (&collector{}).emit); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
 	if gotVolumeID != "" {
-		t.Errorf("networkVolumeId = %q, want empty on the default (no-mount) path", gotVolumeID)
+		t.Errorf("mounts = %q, want none on the default (no-mount) path", gotVolumeID)
 	}
 }
 
 func TestDeploy_PostFailure_GoesToFAILED(t *testing.T) {
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
-			return 500, `{"error":"no capacity"}`
+		if method == "POST" && path == "/v2/pods" {
+			return 500, problem(500, "Internal Server Error", "upstream failure")
 		}
 		t.Errorf("unexpected %s %s after POST failure", method, path)
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client)
 
 	c := &collector{}
@@ -206,9 +208,7 @@ func TestDeploy_NoSKU_OnInstance_GoesToFAILED(t *testing.T) {
 		called.Add(1)
 		return 200, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client)
 
 	inst := okInst()
@@ -234,23 +234,21 @@ func TestDeploy_SKUFromRequirements_AutoProvisioned(t *testing.T) {
 
 	var sawSKU string
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
+		if method == "POST" && path == "/v2/pods" {
 			var req createPodRequest
 			_ = json.Unmarshal(body, &req)
-			if len(req.GPUTypeIDs) > 0 {
-				sawSKU = req.GPUTypeIDs[0]
-			}
-			if req.GPUCount != 2 {
-				t.Errorf("GPUCount = %d, want 2 (from requirements)", req.GPUCount)
+			if req.GPU != nil {
+				sawSKU = req.GPU.ID
+				if req.GPU.Count != 2 {
+					t.Errorf("gpu.count = %d, want 2 (from requirements)", req.GPU.Count)
+				}
 			}
 			return 201, `{"id":"rp-auto-1"}`
 		}
 		t.Errorf("unexpected %s %s", method, path)
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client,
 		WithSSHReadyWait(2*time.Second, 5*time.Millisecond),
 		WithProxyBaseURL(proxyURL),
@@ -270,35 +268,35 @@ func TestDeploy_SKUFromRequirements_AutoProvisioned(t *testing.T) {
 		t.Fatalf("Deploy: %v", err)
 	}
 	if sawSKU != "NVIDIA RTX A5000" {
-		t.Errorf("POST GPUTypeIDs[0] = %q, want SKU resolved from requirements", sawSKU)
+		t.Errorf("POST gpu.id = %q, want SKU resolved from requirements", sawSKU)
 	}
 	if c.lastState() != provisionerv1.DeploymentState_DEPLOYMENT_STATE_RUNNING {
 		t.Errorf("final state = %v, want RUNNING", c.lastState())
 	}
 }
 
-func TestDeploy_PassesFullSKUListWhenAutoProvisioned(t *testing.T) {
-	// Class-only / min-vram requirements (no explicit SKU): the deployer
-	// hands RunPod the FULL cheapest-first match list so the platform
-	// can route around per-SKU capacity outages. Pinning matches[0]
-	// would 500 on "no capacity" whenever the cheapest is saturated.
+func TestDeploy_WalksSKUsAndCloudsWhenAutoProvisioned(t *testing.T) {
+	// Class-only / min-vram requirements (no explicit SKU): v2 places one
+	// GPU type in one cloud per create, so the deployer walks the
+	// cheapest-first match list itself, each SKU on SECURE then COMMUNITY,
+	// moving on when RunPod refuses for capacity. Pinning matches[0] would
+	// fail whenever the cheapest is saturated.
 	proxyURL := proxyServer(t, http.StatusOK)
 
-	var sawSKUs []string
-	var sawPriority string
+	var tried []postedCreate
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
+		if method == "POST" && path == "/v2/pods" {
 			var req createPodRequest
 			_ = json.Unmarshal(body, &req)
-			sawSKUs = req.GPUTypeIDs
-			sawPriority = req.GPUTypePriority
-			return 201, `{"id":"rp-multi-1"}`
+			tried = append(tried, postedCreate{req.GPU.ID, req.Cloud})
+			if len(tried) < 3 {
+				return 400, problem(400, "Bad Request", "There are no longer any instances available with the requested specifications.")
+			}
+			return 201, `{"id":"rp-multi-1","status":"PROVISIONING"}`
 		}
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client,
 		WithSSHReadyWait(2*time.Second, 5*time.Millisecond),
 		WithProxyBaseURL(proxyURL),
@@ -317,35 +315,40 @@ func TestDeploy_PassesFullSKUListWhenAutoProvisioned(t *testing.T) {
 	if err := p.Deploy(context.Background(), okDep(), inst, nil, c.emit); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
-	if len(sawSKUs) < 2 {
-		t.Errorf("GPUTypeIDs len = %d, want >=2 (full match list, not pinned matches[0])", len(sawSKUs))
+	m := MatchSKUs(inst.GetSpec().GetRequirements())
+	want := []postedCreate{{m[0], cloudSecure}, {m[0], cloudCommunity}, {m[1], cloudSecure}}
+	if len(tried) != len(want) {
+		t.Fatalf("tried %v, want %v", tried, want)
 	}
-	if sawPriority != "availability" {
-		t.Errorf("gpuTypePriority = %q, want availability", sawPriority)
+	for i := range want {
+		if tried[i] != want[i] {
+			t.Errorf("placement %d = %v, want %v (all: %v)", i, tried[i], want[i], tried)
+		}
 	}
 }
 
-func TestDeploy_DebugShell_OptsIntoPublicIPAndSSHPort(t *testing.T) {
-	// debug_shell=true is the operator opt-in: pay for publicIp +
-	// expose sshd on a NAT-mapped 22/tcp. Default flow is proxy-only;
-	// this verifies the opt-in flips both fields on the POST body.
+func TestDeploy_DebugShell_OptsIntoSSH(t *testing.T) {
+	// debug_shell=true is the operator opt-in: expose sshd on a
+	// NAT-mapped 22/tcp with the account's keys injected, and stay on the
+	// SECURE cloud where pods get a public IP. Default flow is proxy-only;
+	// this verifies the opt-in flips all three on the POST body.
 	proxyURL := proxyServer(t, http.StatusOK)
 
 	var sawPorts []string
-	var sawSupportIP bool
+	var sawStartSSH bool
+	var clouds []string
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
+		if method == "POST" && path == "/v2/pods" {
 			var req createPodRequest
 			_ = json.Unmarshal(body, &req)
 			sawPorts = req.Ports
-			sawSupportIP = req.SupportPublicIP
+			sawStartSSH = req.StartSSH
+			clouds = append(clouds, req.Cloud)
 			return 201, `{"id":"rp-debug-1"}`
 		}
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client,
 		WithSSHReadyWait(2*time.Second, 5*time.Millisecond),
 		WithProxyBaseURL(proxyURL),
@@ -358,8 +361,11 @@ func TestDeploy_DebugShell_OptsIntoPublicIPAndSSHPort(t *testing.T) {
 	if err := p.Deploy(context.Background(), dep, okInst(), nil, c.emit); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
-	if !sawSupportIP {
-		t.Error("SupportPublicIP=false on debug_shell=true; want true")
+	if !sawStartSSH {
+		t.Error("startSsh=false on debug_shell=true; want true")
+	}
+	if len(clouds) != 1 || clouds[0] != cloudSecure {
+		t.Errorf("clouds tried = %v, want [SECURE] only", clouds)
 	}
 	wantPorts := map[string]bool{"8000/http": true, "22/tcp": true}
 	got := map[string]bool{}
@@ -378,14 +384,12 @@ func TestDeploy_HealthTimeout_GoesToFAILED(t *testing.T) {
 	proxyURL := proxyServer(t, http.StatusServiceUnavailable)
 
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
+		if method == "POST" && path == "/v2/pods" {
 			return 201, `{"id":"rp-engine-2"}`
 		}
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	// Tight timeout so the test finishes fast.
 	p := New(client,
 		WithSSHReadyWait(30*time.Millisecond, 5*time.Millisecond),
@@ -405,15 +409,13 @@ func TestDeploy_HealthTimeout_GoesToFAILED(t *testing.T) {
 func TestDestroy_HappyPath(t *testing.T) {
 	var deleteCalls atomic.Int32
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "DELETE" && path == "/pods/rp-engine-9" {
+		if method == "DELETE" && path == "/v2/pods/rp-engine-9" {
 			deleteCalls.Add(1)
 			return 204, ""
 		}
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client)
 
 	dep := okDep()
@@ -441,9 +443,7 @@ func TestDestroy_AlreadyGone_StillTERMINATED(t *testing.T) {
 		called.Add(1)
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client)
 
 	dep := okDep()
@@ -479,9 +479,7 @@ func TestDestroy_AutoProvisionedReadsInstanceProviderID(t *testing.T) {
 		}
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client)
 
 	dep := okDep()
@@ -497,8 +495,8 @@ func TestDestroy_AutoProvisionedReadsInstanceProviderID(t *testing.T) {
 		t.Errorf("final state = %v, want TERMINATED", c.lastState())
 	}
 	got, _ := deletedPath.Load().(string)
-	if got != "/pods/mw0gmuyupiujzr" {
-		t.Errorf("DELETE path = %q, want /pods/mw0gmuyupiujzr (regression: deployer ignored inst.provider_id)", got)
+	if got != "/v2/pods/mw0gmuyupiujzr" {
+		t.Errorf("DELETE path = %q, want /v2/pods/mw0gmuyupiujzr (regression: deployer ignored inst.provider_id)", got)
 	}
 }
 
@@ -511,13 +509,11 @@ func TestDestroy_AutoProvisionedReadsInstanceProviderID(t *testing.T) {
 func TestDestroy_TransientError_StaysTerminating(t *testing.T) {
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
 		if method == "DELETE" {
-			return 503, `{"error":"service unavailable"}`
+			return 503, problem(503, "Service Unavailable", "service unavailable")
 		}
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client)
 
 	dep := okDep()
@@ -562,22 +558,22 @@ func TestClassifyEnginePhase(t *testing.T) {
 	}
 }
 
-// TestMachinePresent_AcceptsTopLevelMachineID guards the first half of
-// issue 208: RunPod leaves "machine" as {} for the whole deploy and
-// signals host assignment via the top-level machineId, so keying only on
-// the nested object pinned the ladder at scheduling forever.
-func TestMachinePresent_AcceptsTopLevelMachineID(t *testing.T) {
+// TestMachinePresent_ReadsHostFields guards the first half of issue 208
+// on v2: host assignment is read off fields only a host can supply, and a
+// present-but-empty object does not count (the v1 trap was `machine: {}`
+// for a whole deploy).
+func TestMachinePresent_ReadsHostFields(t *testing.T) {
 	cases := []struct {
 		name string
 		pod  podBody
 		want bool
 	}{
 		{"nothing", podBody{}, false},
-		{"empty machine object only", podBody{Machine: &podMachine{}}, false},
-		// The shape observed live on pod 31f66dn93v32fa.
-		{"empty machine but machineId set", podBody{Machine: &podMachine{}, MachineID: "mach-1"}, true},
-		{"machineId with no machine object", podBody{MachineID: "mach-1"}, true},
-		{"populated machine object", podBody{Machine: &podMachine{GPUTypeID: "NVIDIA RTX A5000"}}, true},
+		{"empty ssh block", podBody{SSH: &podSSH{}}, false},
+		{"empty proxy endpoint", podBody{SSH: &podSSH{Proxy: &podSSHEndpoint{}}}, false},
+		{"datacenter assigned", podBody{DataCenterID: "US-KS-2"}, true},
+		{"host cuda version", podBody{CudaVersion: "12.8"}, true},
+		{"proxy endpoint published", podBody{SSH: &podSSH{Proxy: &podSSHEndpoint{Host: "ssh.runpod.io"}}}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -589,19 +585,21 @@ func TestMachinePresent_AcceptsTopLevelMachineID(t *testing.T) {
 }
 
 // TestRuntimeContainerStarted guards the second half of issue 208: the
-// container-start boundary is the v2 `runtime` block's presence, and an
-// empty-but-non-nil block must not count (RunPod returns those).
+// container-start boundary is the `runtime` block's presence, and an
+// empty-but-non-nil block must not count (the documented create response
+// carries one).
 func TestRuntimeContainerStarted(t *testing.T) {
 	cases := []struct {
 		name string
-		rt   *podV2Runtime
+		rt   *podRuntime
 		want bool
 	}{
 		{"nil runtime (still pulling image)", nil, false},
-		{"empty runtime object", &podV2Runtime{}, false},
-		{"ports populated", &podV2Runtime{Ports: []podV2RuntimePort{{PrivatePort: 8000}}}, true},
-		{"cpu sample present", &podV2Runtime{CPU: &podV2Util{Util: 12}}, true},
-		{"gpu sample present", &podV2Runtime{GPUs: []podV2Util{{Util: 0}}}, true},
+		{"empty runtime object", &podRuntime{}, false},
+		{"uptime reported", &podRuntime{Uptime: 3}, true},
+		{"ports populated", &podRuntime{Ports: []podRuntimePort{{Private: 8000}}}, true},
+		{"cpu sample present", &podRuntime{CPU: &podUtil{Util: 12}}, true},
+		{"gpu sample present", &podRuntime{GPUs: []podUtil{{Util: 0}}}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -620,12 +618,12 @@ func TestRuntimeContainerStarted(t *testing.T) {
 // durations. Without the GET /pods status read this whole window was one
 // opaque "engine:waiting".
 func TestDeploy_EmitsFinerColdStartPhases(t *testing.T) {
-	// Proxy /health stays 503 for the first three probes, then 200 -- long
-	// enough for the pod status to walk through all three phases first.
+	// Proxy /health stays 503 for the first five probes, then 200 -- long
+	// enough for the pod status to walk through all four reads below.
 	var healthProbes atomic.Int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/health") {
-			if healthProbes.Add(1) > 3 {
+			if healthProbes.Add(1) > 5 {
 				w.WriteHeader(http.StatusOK)
 				return
 			}
@@ -636,50 +634,38 @@ func TestDeploy_EmitsFinerColdStartPhases(t *testing.T) {
 	}))
 	t.Cleanup(proxy.Close)
 
-	// The pod advances one step per v1 status read: no host (scheduling)
+	// The pod advances one step per status read: no host (scheduling)
 	// -> host assigned (image-pull) -> container runtime live
-	// (engine-init). Host assignment arrives as the top-level machineId
-	// with "machine" left as {}, which is what RunPod actually returns
-	// (issue 208). Container start comes from the v2 `runtime` block,
-	// since v1 does not carry one.
+	// (engine-init). One GET /v2/pods/{id} carries both signals.
 	//
-	// Every v1 response also carries a lastStartedAt stamped at creation,
-	// exactly as RunPod does. That is the regression guard: if anything
-	// starts treating that timestamp as a container-start signal again,
-	// the ladder collapses to engine-init on the first probe and the
-	// image-pull assertion below fails.
+	// Every response also carries a startedAt stamped at creation, the
+	// way v1 stamped lastStartedAt. That is the regression guard: if
+	// anything starts treating that timestamp as a container-start signal
+	// again, the ladder collapses to engine-init on the first probe and
+	// the image-pull assertion below fails. Read three also carries a
+	// present-but-empty runtime, which must read as not-started.
 	var statusReads atomic.Int32
-	const createStampedStarted = `"lastStartedAt":"2026-07-01T00:00:00Z","createdAt":"2026-07-01T00:00:00Z"`
+	const stamped = `"startedAt":"2026-07-01T00:00:00Z","createdAt":"2026-07-01T00:00:00Z","status":"RUNNING"`
 	f := &fakeRunPod{t: t, respond: func(method, path string, body []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
-			return 201, `{"id":"rp-cold-1"}`
-		}
-		if method == "GET" && path == "/pods/rp-cold-1" {
-			switch statusReads.Add(1) {
-			case 1:
-				return 200, `{"id":"rp-cold-1",` + createStampedStarted + `}` // no host -> scheduling
-			default:
-				return 200, `{"id":"rp-cold-1","machine":{},"machineId":"mach-1",` + createStampedStarted + `}` // host -> image-pull
-			}
+		if method == "POST" && path == "/v2/pods" {
+			return 201, `{"id":"rp-cold-1","status":"PROVISIONING"}`
 		}
 		if method == "GET" && path == "/v2/pods/rp-cold-1" {
-			// Runtime stays null (and then present-but-empty, which must
-			// also read as not-started) until the image pull is done.
-			switch {
-			case statusReads.Load() < 2:
-				return 200, `{"id":"rp-cold-1","runtime":null}`
-			case statusReads.Load() < 3:
-				return 200, `{"id":"rp-cold-1","runtime":{}}`
+			switch statusReads.Add(1) {
+			case 1:
+				return 200, `{"id":"rp-cold-1",` + stamped + `,"dataCenterId":null,"ssh":{"proxy":null,"direct":null},"runtime":null}` // no host -> scheduling
+			case 2:
+				return 200, `{"id":"rp-cold-1",` + stamped + `,"dataCenterId":"US-KS-2","runtime":null}` // host -> image-pull
+			case 3:
+				return 200, `{"id":"rp-cold-1",` + stamped + `,"dataCenterId":"US-KS-2","runtime":{}}` // still pulling
 			default:
-				return 200, `{"id":"rp-cold-1","runtime":{"ports":[{"privatePort":8000}],"cpu":{"util":12}}}`
+				return 200, `{"id":"rp-cold-1",` + stamped + `,"dataCenterId":"US-KS-2","runtime":{"uptime":2,"ports":[{"private":8000,"type":"http"}],"cpu":{"util":12}}}`
 			}
 		}
 		t.Errorf("unexpected %s %s", method, path)
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	client := NewClient("test-api-key", WithBaseURL(srv.URL), WithLogsBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	client := f.serve(t)
 	p := New(client,
 		WithSSHReadyWait(2*time.Second, 5*time.Millisecond),
 		WithProxyBaseURL(proxy.URL),
@@ -759,15 +745,13 @@ func (c *collector) lastContainer() string {
 func TestDeployReportsWhatThePodCosts(t *testing.T) {
 	proxyURL := proxyServer(t, http.StatusOK)
 	f := &fakeRunPod{t: t, respond: func(method, path string, _ []byte) (int, string) {
-		if method == "POST" && path == "/pods" {
-			return 201, `{"id":"rp-engine-1","desiredStatus":"RUNNING","costPerHr":21.52}`
+		if method == "POST" && path == "/v2/pods" {
+			return 201, `{"id":"rp-engine-1","status":"PROVISIONING","cost":21.52}`
 		}
 		t.Errorf("unexpected %s %s", method, path)
 		return 500, "{}"
 	}}
-	srv := httptest.NewServer(f.handler())
-	t.Cleanup(srv.Close)
-	p := New(NewClient("test-api-key", WithBaseURL(srv.URL), WithHTTPClient(srv.Client())),
+	p := New(f.serve(t),
 		WithSSHReadyWait(2*time.Second, 5*time.Millisecond),
 		WithProxyBaseURL(proxyURL),
 	)
