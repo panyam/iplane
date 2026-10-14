@@ -113,7 +113,10 @@ func TestRouter_UnknownDeployment_404(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/missing/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	resp, err := http.Post(srv.URL+"/v1/missing/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
@@ -134,7 +137,10 @@ func TestRouter_PendingDeployment_503(t *testing.T) {
 			srv := httptest.NewServer(serveThroughMux(r))
 			defer srv.Close()
 
-			resp, _ := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+			resp, err := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusServiceUnavailable {
 				t.Errorf("status = %d, want 503", resp.StatusCode)
@@ -158,7 +164,10 @@ func TestRouter_FailedDeployment_502_WithReason(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	resp, err := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", resp.StatusCode)
@@ -181,7 +190,10 @@ func TestRouter_TerminatedDeployment_410(t *testing.T) {
 			srv := httptest.NewServer(serveThroughMux(r))
 			defer srv.Close()
 
-			resp, _ := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+			resp, err := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusGone {
 				t.Errorf("status = %d, want 410", resp.StatusCode)
@@ -201,7 +213,10 @@ func TestRouter_DegradedDeployment_502(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	resp, err := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", resp.StatusCode)
@@ -220,7 +235,10 @@ func TestRouter_MissingEngineEndpoint_503(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	resp, err := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
@@ -234,7 +252,10 @@ func TestRouter_DescribeError_502(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	resp, err := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", resp.StatusCode)
@@ -297,7 +318,10 @@ func TestRouter_SuccessfulDispatch_TouchesActivity(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/served/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	resp, err := http.Post(srv.URL+"/v1/served/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	resp.Body.Close()
 
 	if got := client.touchCalls.Load(); got != 1 {
@@ -326,7 +350,10 @@ func TestRouter_UnforwardableDeployment_DoesNotTouch(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/pending/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	resp, err := http.Post(srv.URL+"/v1/pending/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	resp.Body.Close()
 
 	if got := client.touchCalls.Load(); got != 0 {
