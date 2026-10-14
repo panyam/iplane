@@ -61,7 +61,7 @@ var (
 	upTemperature  float64
 )
 
-const upDefaultImage = "vllm/vllm-openai:v0.7.0"
+const upDefaultImage = "vllm/vllm-openai:v0.27.1"
 
 var upCmd = &cobra.Command{
 	Use:   "up",

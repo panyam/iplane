@@ -77,19 +77,19 @@ existing record without re-provisioning.
   # rents the GPU and runs the engine on it
   iplane deployment deploy my-llama \
       --provider runpod --class small \
-      --image vllm/vllm-openai:v0.7.0 \
+      --image vllm/vllm-openai:v0.27.1 \
       --model Qwen/Qwen2.5-1.5B-Instruct
 
   # Place onto an existing instance (SSH+docker / VM providers)
   iplane deployment deploy my-llama \
       --instance my-pod \
-      --image vllm/vllm-openai:v0.7.0 \
+      --image vllm/vllm-openai:v0.27.1 \
       --model Qwen/Qwen2.5-1.5B-Instruct
 
   # Preview without provisioning
   iplane deployment deploy my-llama \
       --provider runpod --class small \
-      --image vllm/vllm-openai:v0.7.0 \
+      --image vllm/vllm-openai:v0.27.1 \
       --model Qwen/Qwen2.5-1.5B-Instruct --dry-run`,
 	RunE: runDeploymentDeploy,
 }
@@ -202,7 +202,7 @@ func init() {
 	f.StringVar(&deployProvider, "provider", "",
 		`provider to auto-provision on, e.g. runpod (required when --instance is omitted)`)
 	f.StringVar(&deployRegion, "region", "", `region hint for auto-provisioning (optional)`)
-	f.StringVar(&deployImage, "image", "", `engine container image, e.g. vllm/vllm-openai:v0.7.0 (required)`)
+	f.StringVar(&deployImage, "image", "", `engine container image, e.g. vllm/vllm-openai:v0.27.1 (required)`)
 	f.StringVar(&deployModel, "model", "",
 		`HF model id, e.g. Qwen/Qwen2.5-1.5B-Instruct (required; see 'iplane deployment models' for a starter list)`)
 	f.StringVar(&deployClass, "class", "", `gpu class for auto-provisioning: small | medium | large | xlarge`)

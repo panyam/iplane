@@ -32,12 +32,12 @@ services:
   # authoring).
   vllm:
     profiles: ["gpu"]
-    image: vllm/vllm-openai:v${ENGINE_VERSION:-0.7.3}
+    image: vllm/vllm-openai:v${ENGINE_VERSION:-0.27.1}
     command:
-      - "--model=${MODEL_HF_ID:-Qwen/Qwen3.5-8B-Instruct}"
+      - "--model=${MODEL_HF_ID:-Qwen/Qwen3-8B}"
       - "--host=0.0.0.0"
       - "--port=8000"
-      - "--max-model-len=${MODEL_CONTEXT:-32768}"
+      - "--max-model-len=${MODEL_SERVE_CONTEXT:-16384}"
       - "--gpu-memory-utilization=0.90"
     ports:
       - "${ENGINE_PORT:-8000}:8000"
