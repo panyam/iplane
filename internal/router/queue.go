@@ -90,6 +90,15 @@ func (s schedulerEntry) StampEnqueued(t time.Time) { s.queueEntry.enqueuedAt = t
 func (s schedulerEntry) EnqueuedAt() time.Time     { return s.queueEntry.enqueuedAt }
 func (s schedulerEntry) Replicas() int             { return s.queueEntry.replicas }
 
+// Reject answers a request the scheduler accepted but will never
+// dispatch because the router is shutting down, and releases the HTTP
+// handler blocked on done. Without it that client hangs.
+func (s schedulerEntry) Reject(error) {
+	writeOpenAIError(s.w, http.StatusServiceUnavailable,
+		"router is shutting down", "router_shutting_down")
+	close(s.done)
+}
+
 // queueWaitCtxKey is the unexported context key the dispatcher uses
 // to pass the per-request queue-wait duration (milliseconds) into
 // handleWithObservability. Set only on the queued path; the direct-

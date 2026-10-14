@@ -118,3 +118,59 @@ func TestInteractiveFirst_Stop_WaitsForHandedOffRequests(t *testing.T) {
 		t.Fatal("Stop returned before the in-flight request finished")
 	}
 }
+
+// rejectEntry records whether the scheduler gave up on it.
+type rejectEntry struct {
+	fakeEntry
+	rejected chan error
+}
+
+func (e *rejectEntry) Reject(err error) { e.rejected <- err }
+
+// Stop with one entry blocked on a full deployment cap and another
+// still in the lane: neither will ever reach the handler, so both must
+// be rejected, or whoever is waiting on them (an HTTP client) hangs.
+// The slot waiter is rejected without waiting for the in-flight
+// request to finish.
+func TestInteractiveFirst_Stop_RejectsEntriesThatNeverDispatch(t *testing.T) {
+	hold := make(chan struct{})
+	running := make(chan struct{}, 1)
+	s := newScheduler(t, 1, 1, func(_ context.Context, _ Entry) {
+		running <- struct{}{}
+		<-hold
+	})
+	s.Start(context.Background())
+
+	inFlight := &rejectEntry{fakeEntry: fakeEntry{seq: 1, deploy: "d1", priority: LaneInteractive}, rejected: make(chan error, 1)}
+	waiter := &rejectEntry{fakeEntry: fakeEntry{seq: 2, deploy: "d1", priority: LaneInteractive}, rejected: make(chan error, 1)}
+	queued := &rejectEntry{fakeEntry: fakeEntry{seq: 3, deploy: "d1", priority: LaneBatch}, rejected: make(chan error, 1)}
+	_ = s.Submit(inFlight)
+	<-running
+	_ = s.Submit(waiter)
+	if !waitForLen(func() int { return s.Len(LaneInteractive) }, 0) {
+		t.Fatal("worker never popped the slot waiter")
+	}
+	time.Sleep(10 * time.Millisecond) // worker is now parked in acquire
+	_ = s.Submit(queued)
+
+	stopped := make(chan struct{})
+	go func() { s.Stop(); close(stopped) }()
+
+	for _, e := range []*rejectEntry{waiter, queued} {
+		select {
+		case err := <-e.rejected:
+			if err != ErrSchedulerClosed {
+				t.Errorf("entry %d rejected with %v, want ErrSchedulerClosed", e.seq, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("entry %d was dropped at Stop without being rejected", e.seq)
+		}
+	}
+	close(hold)
+	<-stopped
+	select {
+	case err := <-inFlight.rejected:
+		t.Errorf("the dispatched entry was also rejected: %v", err)
+	default:
+	}
+}
