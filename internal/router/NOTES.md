@@ -7,6 +7,14 @@ or assuming a demo's default.
 
 `router.queue.servicers` defaults to `0` in `deploy/config.yaml`, which means no scheduler is constructed and the router takes the direct-forward path (Beat 1 behavior). The v0.2 release/v0.2 snapshot ships with this default to avoid surprising operators on existing deploys; demo 05 requires `servicers > 0` (and `in_flight_cap > 0` for the queue-pressure story to be visible). Documented in `examples/05-fair-queueing/README.md`'s troubleshooting section.
 
+## `in_flight_cap` is per replica, and it decides who holds a request
+
+With `in_flight_cap > 0` a deployment may have `in_flight_cap x` (routable replicas) requests at its engines, and the scheduler's workers only pop and hand off: the slot is held for the engine round trip, the worker is not. With `in_flight_cap: 0` each worker carries its request to completion, so `servicers` is a global ceiling of `servicers / R` requests per second across every deployment, whatever the replica count (Little's law). Demo 06 used to run that way with 16 servicers and its replica-scaling curve stayed flat. Demo 05 keeps the cap at 0 on purpose, to make a queue build. Pinned by `TestRouter_Queued_ThroughputScalesWithReplicas`.
+
+## DEGRADED still serves
+
+A DEGRADED deployment forwards like RUNNING, over whichever replicas are stamped and not quarantined; only a DEGRADED record with no endpoint at all answers 502. The idle-TTL reaper treats it like RUNNING too, since it is still billing.
+
 ## Priority is request-level, not deployment-level
 
 When tempted to put routing/queueing policy on a runtime artifact (Deployment, Instance), check whether the property describes the artifact itself or the *traffic flowing through it*. If traffic, it belongs at the routing layer, not on the artifact. See `protos/provisioner/v1/types.proto`'s reserved-field-22 comment for the receipt; PR 131 corrected this mid-review.

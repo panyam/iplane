@@ -89,7 +89,10 @@ func TestRouter_Flat_MissingModel_400(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[]}`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
@@ -105,7 +108,10 @@ func TestRouter_Flat_MalformedJSON_400(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{not json`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{not json`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
@@ -122,7 +128,10 @@ func TestRouter_Flat_ModelNotFound_404(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"absent/model","messages":[]}`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"absent/model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
@@ -172,7 +181,10 @@ func TestRouter_Flat_MultipleMatches_PicksNewestRunning(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -195,10 +207,52 @@ func TestRouter_Flat_AllMatchesNotRunning_503ish(t *testing.T) {
 	srv := httptest.NewServer(serveThroughMux(r))
 	defer srv.Close()
 
-	resp, _ := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// A DEGRADED deployment is still serving, so the flat URL ranks it
+// ahead of one that is not serving yet, even a newer one.
+func TestRouter_Flat_PrefersDegradedOverNotYetServing(t *testing.T) {
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"degraded-but-serving"}`)
+	}))
+	defer engine.Close()
+	r := newFlatTestRouter(func(_ *provisionerv1.ListDeploymentsRequest) (*provisionerv1.ListDeploymentsResponse, error) {
+		return &provisionerv1.ListDeploymentsResponse{Deployments: []*provisionerv1.Deployment{
+			{
+				Id: "half-up", Model: "test/model",
+				State:     provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED,
+				CreatedAt: timestamppb.New(time.Now().Add(-time.Hour)),
+				Replicas: []*provisionerv1.ReplicaBacking{
+					{InstanceIds: []string{"a"}, EngineEndpoint: engine.URL},
+					{InstanceIds: []string{"b"}},
+				},
+			},
+			{
+				Id: "warming-up", Model: "test/model",
+				State:     provisionerv1.DeploymentState_DEPLOYMENT_STATE_STARTING,
+				CreatedAt: timestamppb.New(time.Now()),
+			},
+		}}, nil
+	})
+	srv := httptest.NewServer(serveThroughMux(r))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "degraded-but-serving") {
+		t.Errorf("status = %d body = %s; want 200 from the DEGRADED deployment", resp.StatusCode, body)
 	}
 }
 

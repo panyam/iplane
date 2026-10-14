@@ -61,8 +61,11 @@ router:
   #    independently. Servicers is shared across lanes (the scheduler
   #    is one pool of workers servicing both queues).
   #
-  # in_flight_cap > 0 caps concurrent in-flight per deployment; 0
-  # means unlimited (only the worker count bounds engine load).
+  # in_flight_cap > 0 caps concurrent in-flight per replica, so a
+  # deployment gets in_flight_cap x its healthy replicas and workers
+  # only dispatch. 0 means unlimited per deployment: each worker then
+  # carries its request to completion and the worker count is the one
+  # global bound on engine load (servicers / round-trip time).
   queue:
     servicers: 0
     capacity: 256

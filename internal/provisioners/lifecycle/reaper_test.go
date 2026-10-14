@@ -124,10 +124,11 @@ func TestReaper_ZeroTTL_Skipped(t *testing.T) {
 }
 
 func TestReaper_NonRunningStates_Skipped(t *testing.T) {
-	// Reaper only touches RUNNING (idle reap) or TERMINATING (retry
-	// stuck destroy). STARTING/CONFIGURING/PENDING would clobber an
-	// in-progress deploy; FAILED is a permanent give-up; TERMINATED
-	// is already done; DEGRADED stays for diagnostics.
+	// Reaper only touches the serving states RUNNING and DEGRADED
+	// (idle reap) or TERMINATING (retry stuck destroy).
+	// STARTING/CONFIGURING/PENDING would clobber an in-progress
+	// deploy; FAILED is a permanent give-up; TERMINATED is already
+	// done.
 	//
 	// TERMINATING is covered by TestReaper_TerminatingState_RetriesDestroy.
 	now := time.Now()
@@ -136,7 +137,6 @@ func TestReaper_NonRunningStates_Skipped(t *testing.T) {
 		provisionerv1.DeploymentState_DEPLOYMENT_STATE_PENDING,
 		provisionerv1.DeploymentState_DEPLOYMENT_STATE_STARTING,
 		provisionerv1.DeploymentState_DEPLOYMENT_STATE_CONFIGURING,
-		provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED,
 		provisionerv1.DeploymentState_DEPLOYMENT_STATE_TERMINATED,
 		provisionerv1.DeploymentState_DEPLOYMENT_STATE_FAILED,
 	}
@@ -151,6 +151,22 @@ func TestReaper_NonRunningStates_Skipped(t *testing.T) {
 				t.Errorf("state %v should not be reaped", st)
 			}
 		})
+	}
+}
+
+// A DEGRADED deployment is still serving on its healthy replicas and
+// still billing for them, so an idle one is a leak exactly like an idle
+// RUNNING one. Leaving it alone "for diagnostics" turned a partial
+// failure at deploy time into an open-ended bill.
+func TestReaper_IdleDegraded_Reaped(t *testing.T) {
+	now := time.Now()
+	svc := &fakeService{deployments: []*provisionerv1.Deployment{
+		dep("half-up", provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED, 60, now.Add(-time.Hour)),
+	}}
+	r := New(svc, WithClock(fixedClock(now)))
+	r.RunOnce(context.Background())
+	if svc.destroyCalls.Load() != 1 {
+		t.Errorf("idle DEGRADED deployment should be reaped; destroy count = %d", svc.destroyCalls.Load())
 	}
 }
 

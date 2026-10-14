@@ -38,13 +38,32 @@ import (
 // the configured weight ratio. Tenants without an entry in the
 // operator-supplied Weights map get DefaultTenantWeight (= 1).
 //
-// # In-flight cap
+// # In-flight cap and who holds a request
 //
-// Before invoking the handler, a worker acquires a slot from the
-// deployment's semaphore. When cap is 0 (the unlimited default),
-// no semaphore is consulted -- the workers themselves are the only
-// concurrency bound. cap > 0 caps concurrent in-flight to that
-// many entries PER DEPLOYMENT ID.
+// InFlightCap is per replica, mirroring the engine's max-num-seqs,
+// which is a per-engine setting. A deployment's concurrency bound is
+// InFlightCap x the replicas its entries report (ReplicaCounter), so
+// it grows when the deployment scales and shrinks when a replica is
+// quarantined.
+//
+// When cap > 0 a worker only dispatches: it pops an entry, waits for
+// one of the deployment's slots, then runs the handler on its own
+// goroutine and goes back to the queue. The slot, not the worker, is
+// held for the engine round trip. This is what keeps the worker count
+// k from becoming a global ceiling. A worker that held each request
+// for its whole round trip R capped the daemon at k/R requests per
+// second across every deployment (Little's law), so adding replicas
+// behind the router did nothing once k requests were in flight.
+//
+// When cap is 0 (unlimited) there is no per-deployment bound to hand
+// off against, so the worker runs the handler inline and k is the one
+// global concurrency bound. That is the deliberate small-window mode
+// Demo 05 uses to make a queue build.
+//
+// Either way, strict priority and fair share act at the pop, which
+// happens only when a worker is free and, with a cap, only after the
+// previous entry got its slot. Queued entries wait in the lanes, so
+// an interactive arrival still overtakes waiting batch work.
 //
 // # Starvation
 //
@@ -77,8 +96,8 @@ type InteractiveFirst struct {
 	// Per-deployment in-flight slots. Lazily created on first
 	// dispatch to a given deployment id. When inFlightCap == 0
 	// this map stays empty and the workers skip the acquire path.
-	semMu sync.Mutex
-	sems  map[string]chan struct{}
+	slotsMu sync.Mutex
+	slots   map[string]*deploymentSlots
 }
 
 // idle backoff bounds. Workers poll the queues directly; when both
@@ -128,7 +147,11 @@ type EnqueueTimestamper interface {
 
 // InteractiveFirstConfig configures the scheduler at construction.
 type InteractiveFirstConfig struct {
-	// Workers is k: the number of concurrent dispatcher goroutines.
+	// Workers is k: the number of dispatcher goroutines. With
+	// InFlightCap > 0 they only pop and hand off, so k bounds how
+	// many deployments can be waiting on a full cap at once, not how
+	// many requests are in flight. With InFlightCap == 0 each worker
+	// carries its request to completion and k is the global bound.
 	Workers int
 
 	// InteractiveCapacity / BatchCapacity bound each PER-TENANT
@@ -137,8 +160,9 @@ type InteractiveFirstConfig struct {
 	InteractiveCapacity int
 	BatchCapacity       int
 
-	// InFlightCap is the per-deployment concurrent in-flight bound.
-	// 0 means unlimited.
+	// InFlightCap is the concurrent in-flight bound per replica; a
+	// deployment gets InFlightCap x its replica count. 0 means
+	// unlimited, leaving Workers as the only bound.
 	InFlightCap int
 
 	// Weights is the per-tenant fair-share table. Tenants not
@@ -187,7 +211,7 @@ func NewInteractiveFirst(cfg InteractiveFirstConfig) *InteractiveFirst {
 		interactive: newLaneState(LaneInteractive, weights, cfg.InteractiveCapacity),
 		batch:       newLaneState(LaneBatch, weights, cfg.BatchCapacity),
 		observer:    obs,
-		sems:        map[string]chan struct{}{},
+		slots:       map[string]*deploymentSlots{},
 	}
 }
 
@@ -316,10 +340,12 @@ func (s *InteractiveFirst) workerLoop() {
 	}
 }
 
-// dispatch acquires the per-deployment in-flight slot (if cap
-// configured), invokes the handler, releases the slot. Also fires
-// the observer's OnPop with wait-duration computed from the entry's
-// enqueued-at timestamp.
+// dispatch fires the observer's OnPop with wait-duration computed
+// from the entry's enqueued-at timestamp, then runs the handler. With
+// a cap it first takes one of the deployment's slots and hands the
+// request to its own goroutine, so the worker is free for the next
+// pop while the engine works; see "In-flight cap and who holds a
+// request" on InteractiveFirst.
 func (s *InteractiveFirst) dispatch(lane string, e Entry) {
 	tenantID := tenantFromEntry(e)
 	deploymentID := e.DeploymentID()
@@ -330,34 +356,41 @@ func (s *InteractiveFirst) dispatch(lane string, e Entry) {
 		}
 	}
 	// Observer fires AFTER the pop, BEFORE the per-deployment
-	// semaphore wait -- the wait-time histogram should reflect
+	// slot wait -- the wait-time histogram should reflect
 	// queue dwell time only, not in-flight-cap throttling.
 	depth := s.laneFor(lane).lenForTenant(tenantID)
 	s.observer.OnPop(lane, tenantID, deploymentID, depth, waitDur)
 
-	if s.inFlightCap > 0 {
-		sem := s.semaphoreFor(deploymentID)
-		select {
-		case sem <- struct{}{}:
-			defer func() { <-sem }()
-		case <-s.rootCtx.Done():
-			return
-		}
+	if s.inFlightCap == 0 {
+		s.handler(s.rootCtx, e)
+		return
 	}
-	s.handler(s.rootCtx, e)
+	slots := s.slotsFor(deploymentID)
+	if !slots.acquire(s.rootCtx, s.inFlightCap*replicasFromEntry(e)) {
+		reject(e) // Stop ran while this entry waited for a slot
+		return
+	}
+	// Tracked on wg so Stop drains handed-off requests as well as
+	// the workers. Add from a running worker is safe against a
+	// concurrent Wait because the worker's own count is still held.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer slots.release()
+		s.handler(s.rootCtx, e)
+	}()
 }
 
-// semaphoreFor lazily creates the per-deployment in-flight slot
-// channel. Capacity == inFlightCap.
-func (s *InteractiveFirst) semaphoreFor(deployID string) chan struct{} {
-	s.semMu.Lock()
-	defer s.semMu.Unlock()
-	if existing, ok := s.sems[deployID]; ok {
+// slotsFor lazily creates the per-deployment in-flight counter.
+func (s *InteractiveFirst) slotsFor(deployID string) *deploymentSlots {
+	s.slotsMu.Lock()
+	defer s.slotsMu.Unlock()
+	if existing, ok := s.slots[deployID]; ok {
 		return existing
 	}
-	ch := make(chan struct{}, s.inFlightCap)
-	s.sems[deployID] = ch
-	return ch
+	d := newDeploymentSlots()
+	s.slots[deployID] = d
+	return d
 }
 
 // Stop closes both lane states (which cascades to every per-tenant
@@ -373,7 +406,32 @@ func (s *InteractiveFirst) Stop() {
 	s.interactive.close()
 	s.batch.close()
 	s.rootCancel()
+	// Workers exit on the cancel without draining the lanes, so
+	// whatever is still queued will never dispatch. Reject it now
+	// rather than after wg.Wait, so those callers are not held until
+	// the in-flight requests finish.
+	s.rejectQueued(s.interactive)
+	s.rejectQueued(s.batch)
 	s.wg.Wait()
+}
+
+// rejectQueued empties a closed lane, rejecting each entry. A worker
+// that has not yet seen the cancel may pop concurrently; each entry is
+// popped exactly once, so it is either dispatched there or rejected
+// here.
+func (s *InteractiveFirst) rejectQueued(ls *laneState) {
+	for {
+		e, err := ls.tryPop(context.Background())
+		switch {
+		case err == nil:
+			reject(e)
+		case errors.Is(err, queue.ErrClosed):
+			return
+		default:
+			// Lost a race for the last item; look again.
+			time.Sleep(time.Millisecond)
+		}
+	}
 }
 
 // Len returns the current waiting depth on the named lane (sum
