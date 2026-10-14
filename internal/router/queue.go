@@ -43,6 +43,11 @@ type queueEntry struct {
 	TenantID          string
 	Priority          provisionerv1.Priority
 
+	// replicas is how many replicas dep can route to at enqueue
+	// time. The scheduler multiplies its per-replica in-flight cap
+	// by this, so a deployment's concurrency follows its capacity.
+	replicas int
+
 	enqueuedAt time.Time
 }
 
@@ -78,11 +83,12 @@ type schedulerEntry struct {
 	*queueEntry
 }
 
-func (s schedulerEntry) Priority() string         { return s.priorityLabelString() }
-func (s schedulerEntry) DeploymentID() string     { return s.queueEntry.DeploymentID() }
-func (s schedulerEntry) Tenant() string           { return s.queueEntry.TenantID }
+func (s schedulerEntry) Priority() string          { return s.priorityLabelString() }
+func (s schedulerEntry) DeploymentID() string      { return s.queueEntry.DeploymentID() }
+func (s schedulerEntry) Tenant() string            { return s.queueEntry.TenantID }
 func (s schedulerEntry) StampEnqueued(t time.Time) { s.queueEntry.enqueuedAt = t }
-func (s schedulerEntry) EnqueuedAt() time.Time    { return s.queueEntry.enqueuedAt }
+func (s schedulerEntry) EnqueuedAt() time.Time     { return s.queueEntry.enqueuedAt }
+func (s schedulerEntry) Replicas() int             { return s.queueEntry.replicas }
 
 // queueWaitCtxKey is the unexported context key the dispatcher uses
 // to pass the per-request queue-wait duration (milliseconds) into
@@ -146,6 +152,7 @@ func (r *Router) enqueueOrServe(w http.ResponseWriter, req *http.Request, dep *p
 		done:              make(chan struct{}),
 		TenantID:          tenantFromContext(req.Context()),
 		Priority:          priority,
+		replicas:          len(r.eligibleReplicas(dep)),
 	}
 	if err := r.scheduler.Submit(schedulerEntry{entry}); err != nil {
 		switch {

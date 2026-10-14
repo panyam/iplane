@@ -93,9 +93,10 @@ type RouterConfig struct {
 // Backward-compat: when only the top-level Capacity is set (Beat 2.1
 // shape), both lanes inherit that capacity.
 //
-// InFlightCap (Beat 2.4) is the per-deployment in-flight bound
-// the scheduler enforces -- mirrors the engine's max-num-seqs so
-// iplane doesn't outpace the engine's batcher.
+// InFlightCap (Beat 2.4) is the per-replica in-flight bound the
+// scheduler enforces -- mirrors the engine's max-num-seqs so iplane
+// doesn't outpace any engine's batcher. A deployment gets InFlightCap
+// x its healthy replicas. 0 leaves Servicers as the global bound.
 //
 // All zero values is the Beat 1 path: direct forward, no scheduler.
 type QueueConfig struct {
