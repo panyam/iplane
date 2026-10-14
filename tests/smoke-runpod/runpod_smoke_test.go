@@ -9,8 +9,8 @@
 // Run:
 //
 //	export RUNPOD_API_KEY=...
-//	make smoke-runpod              # read-only List (free)
-//	RUNPOD_RENT=1 make smoke-runpod  # also rents + terminates a pod (~$0.05)
+//	make smoke-runpod     # List, then rents + terminates a pod (~$0.05)
+//	make runpod-v2-check  # read-only, free (readonly_test.go)
 //
 // The smoke flow's shared core moved in v0.2 ch7-beat3.11 follow-up
 // when the Vast.ai smoke test came online -- two providers using a
@@ -64,10 +64,10 @@ func TestRunPod_SpawnAndTerminate(t *testing.T) {
 		// that `make smoke-runpod` rents on every run when the key
 		// is set. Operators who want the cost gate set
 		// CostEnv="RUNPOD_RENT" via a future env-driven config.
-		ExpectHourlyRate: true, // RunPod stamps costPerHr on the pod record
-		// Server-side List filter by iplane-id catches the post-
-		// spawn instance even before it transitions to ACTIVE.
-		// RunPod's ?name= is exact-match, so we pass the full
+		ExpectHourlyRate: true, // RunPod stamps cost on the pod record
+		// List filter by iplane-id catches the post-spawn instance
+		// even before it transitions to ACTIVE. The match is exact
+		// (client-side since v2 dropped ?name=), so we pass the full
 		// stamped spec ID (not a "smoke-" prefix, which never
 		// matched and silently returned 0 refs).
 		ListFilterFn: func(id string) map[string]string {

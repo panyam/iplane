@@ -62,7 +62,7 @@ type Config struct {
 
 	// ExpectHourlyRate, when true, asserts the spawned Instance
 	// has a positive hourly_rate_usd populated. RunPod stamps this
-	// from the pod's costPerHr; some adapters don't (yet). False
+	// from the pod's cost; some adapters don't (yet). False
 	// is the safe default.
 	ExpectHourlyRate bool
 
@@ -70,7 +70,7 @@ type Config struct {
 	// for the post-spawn verification, given the stamped spec ID
 	// (which core picks each run). Different providers want
 	// different filter shapes: RunPod uses {iplane-id: <exact ID>}
-	// (server-side exact match via ?name=); Vast uses
+	// (exact match on the pod name, client-side); Vast uses
 	// {label-prefix: iplane-} (server-side prefix match). A
 	// hardcoded map would work for prefix-style filters but not
 	// for exact-match ones, hence the function form. When nil, the
