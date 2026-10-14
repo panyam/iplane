@@ -117,6 +117,11 @@ type Config struct {
 	// run spent sixty minutes and $23 timing out at engine:init with no
 	// record of what vLLM was doing.
 	Logs func(ctx context.Context) string
+	// TimeoutHint is appended to the deadline error, naming the knob
+	// that sets Timeout. The deadline is the daemon's and nothing on the
+	// CLI changes it, so an operator who reads only "did not answer
+	// within 30m" raises --timeout and times out again in the same place.
+	TimeoutHint string
 }
 
 // Wait polls until the engine answers, the deadline passes, the caller
@@ -204,9 +209,13 @@ func Wait(ctx context.Context, c Config) (string, error) {
 		case <-time.After(c.Interval):
 		}
 		if time.Now().After(deadline) {
+			hint := ""
+			if c.TimeoutHint != "" {
+				hint = "; " + c.TimeoutHint
+			}
 			return endpoint, withEngineLogs(ctx, c, fmt.Errorf(
-				"engine did not answer /health within %s, still at %s; last: %s",
-				c.Timeout, phase, describe(last)))
+				"engine did not answer /health within %s, still at %s; last: %s%s",
+				c.Timeout, phase, describe(last), hint))
 		}
 	}
 }

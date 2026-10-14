@@ -21,6 +21,15 @@ mid-download and fails. The RunPod deployer sizes `ContainerDiskInGB` from
 `min_disk_gb` (was hardcoded 20 GB); `min_disk_gb` now **sizes the container
 disk and no longer filters SKUs** (`DefaultDiskGb` was never a per-SKU ceiling,
 since disk is an independent create param).
+When `--min-disk-gb` is not given (or is smaller), the Service now raises
+`min_disk_gb` to `DiskFloorGB(checkpoint download bytes)`: weights x1.1 plus
+40 GB for the engine image, rounded up to 10 GB (200 for a 72B at BF16, 570
+for GLM-5.2 AWQ). It needs a `CheckpointSource` model store and is skipped
+for a warm mount; with no size the provider default stands (Vast 40, RunPod
+20) and Vast's failure message names `--min-disk-gb` if the disk fills. The
+CLI `--timeout` default is now 45m, and Vast's engine-ready wait scales with
+the container disk (10m + 10s per GB, never under 30m) unless
+`IPLANE_ENGINE_READY_TIMEOUT` is set.
 `examples/08-scaling-30b/08a-cold-start-distance/` sets the three timeouts
 (20-45m) and `--min-disk-gb` (150 for a 72B FP8). Cross-cutting: the 72B FP8
 cold-start run needed a **Blackwell-capable vLLM image**
