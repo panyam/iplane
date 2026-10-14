@@ -167,3 +167,41 @@ func TestSKUNamingStillEncodesFormFactor(t *testing.T) {
 		}
 	}
 }
+
+// RunPod rents H100 NVL, and NVL is a factory-bridged pair. Four of them are
+// two NVLink islands, so a four-way intra-node request must not resolve to
+// them, while two of them, and an eight-card SXM board, still must.
+func TestMatchSKUsIntraNodeRefusesBridgedPairsPastTwo(t *testing.T) {
+	intra := func(n int32) []string {
+		return MatchSKUs(&provisionerv1.ResourceRequirements{
+			MinVramGb:   80,
+			GpuCount:    n,
+			FabricScope: provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE,
+		})
+	}
+	if got := intra(4); slices.Contains(got, "NVIDIA H100 NVL") {
+		t.Errorf("4-card intra-node matched H100 NVL, two islands of two; got %v", got)
+	}
+	if got := intra(2); !slices.Contains(got, "NVIDIA H100 NVL") {
+		t.Errorf("2-card intra-node lost H100 NVL, one bridged pair; got %v", got)
+	}
+	if got := intra(8); !slices.Contains(got, "NVIDIA H100 80GB HBM3") {
+		t.Errorf("8-card intra-node lost the H100 SXM board; got %v", got)
+	}
+}
+
+// The no-match error has to say why, or a refused four-way NVL request reads
+// as "nothing in stock".
+func TestSplitHintNamesTheRefusedFamily(t *testing.T) {
+	reqs := &provisionerv1.ResourceRequirements{
+		GpuCount:    4,
+		FabricScope: provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE,
+	}
+	if h := splitHint(reqs); !strings.Contains(h, "h100-nvl") || !strings.Contains(h, "islands") {
+		t.Errorf("splitHint = %q, want it to name h100-nvl as islands", h)
+	}
+	reqs.GpuCount = 2
+	if h := splitHint(reqs); h != "" {
+		t.Errorf("splitHint at 2 cards = %q, want empty", h)
+	}
+}

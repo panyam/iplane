@@ -288,6 +288,13 @@ func summarizeAnswers(answers []*provisioners.ProviderAnswer) []map[string]any {
 // published a bad number. This is the display half of the rule the fabric
 // package enforces in code.
 func candidateFabricLabel(c *provisioners.Candidate) string {
+	sourced := c.GetFabricSource() == provisionerv1.FabricSource_FABRIC_SOURCE_DECLARED ||
+		c.GetFabricSource() == provisionerv1.FabricSource_FABRIC_SOURCE_MEASURED
+	// A sourced verdict with no scope is a split group: the cards carry a
+	// fabric that does not join all of them, such as two bridged pairs.
+	if sourced && c.GetFabricScope() == provisionerv1.FabricScope_FABRIC_SCOPE_UNSPECIFIED {
+		return "split (no one fabric spans every card)"
+	}
 	switch c.GetFabricSource() {
 	case provisionerv1.FabricSource_FABRIC_SOURCE_UNKNOWN:
 		return "unknown (host reports no reading)"

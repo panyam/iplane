@@ -198,8 +198,8 @@ func TestEveryVastSKUHasAKnownFamily(t *testing.T) {
 			t.Errorf("%q has no fabric.Family", sku.GpuName)
 			continue
 		}
-		if !fabric.CouldSatisfy(sku.Family, provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE) &&
-			!fabric.CouldSatisfy(sku.Family, provisionerv1.FabricScope_FABRIC_SCOPE_NONE) {
+		if !fabric.CouldSatisfy(sku.Family, provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE, 0) &&
+			!fabric.CouldSatisfy(sku.Family, provisionerv1.FabricScope_FABRIC_SCOPE_NONE, 0) {
 			t.Errorf("%q maps to family %q which the fabric catalog does not know", sku.GpuName, sku.Family)
 		}
 	}

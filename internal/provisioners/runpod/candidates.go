@@ -205,7 +205,7 @@ func candidateRow(g gpuCatalogEntry, cloud string, price float64, gpuCount int) 
 		family = spec.Family
 		exactBytes = skucatalog.ExactVRAMBytes(spec.VRAMGb)
 	}
-	res := fabric.Resolve(fabric.Observation{Family: family})
+	res := fabric.Resolve(fabric.Observation{Family: family, GpuCount: int32(gpuCount)})
 
 	return &provisioners.Candidate{
 		// No HostID, no OfferID, and no Region. RunPod rents a GPU type

@@ -83,7 +83,11 @@ var skus = []SKUSpec{
 	// XL (>=94 GB VRAM): frontier / 400B-class multi-host.
 	{GpuTypeID: "NVIDIA H100 NVL", VRAMGb: 94, DefaultSystemRAMGb: 128, PriceUSDPerHour: 2.99, Family: fabric.FamilyH100NVL},
 	{GpuTypeID: "NVIDIA H200", VRAMGb: 141, DefaultSystemRAMGb: 192, PriceUSDPerHour: 3.99, Family: fabric.FamilyH200SXM},
-	{GpuTypeID: "NVIDIA B200", VRAMGb: 192, DefaultSystemRAMGb: 256, PriceUSDPerHour: 5.99, Family: fabric.FamilyB200},
+	// 180, not the 192 of the launch announcement. NVIDIA's shipping spec
+	// is 180 GB (1440 GB per 8-GPU DGX B200), Lambda sells it as 180, and a
+	// Vast host reports 183359 MiB, which is 179 GiB. The 192 is the same
+	// memory counted in decimal gigabytes.
+	{GpuTypeID: "NVIDIA B200", VRAMGb: 180, DefaultSystemRAMGb: 256, PriceUSDPerHour: 5.99, Family: fabric.FamilyB200},
 }
 
 // Class-to-constraint-defaults lives in the service layer
@@ -220,4 +224,10 @@ func (p *Provider) CardCapacityBytes(sku string) int64 {
 		return 0
 	}
 	return skucatalog.ExactVRAMBytes(spec.VRAMGb)
+}
+
+// splitHint names the families an intra-node request refused because their
+// fabric does not join that many cards, as a suffix for a no-match error.
+func splitHint(reqs *provisionerv1.ResourceRequirements) string {
+	return skucatalog.SplitHint(catalogEntries(), reqs)
 }

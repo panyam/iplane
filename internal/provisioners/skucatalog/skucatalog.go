@@ -17,6 +17,7 @@ package skucatalog
 
 import (
 	"sort"
+	"strings"
 
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
 	"github.com/inference-book/inference-plane/internal/provisioners/fabric"
@@ -149,7 +150,7 @@ func Match(entries []Entry, reqs *provisionerv1.ResourceRequirements, mode Fabri
 		if e.GPUCount > 0 && reqs.GetGpuCount() > 0 && e.GPUCount < int(reqs.GetGpuCount()) {
 			continue
 		}
-		if !satisfiesFabric(e.Family, reqs, mode) {
+		if !satisfiesFabric(e.Family, reqs, int32(gpuCount), mode) {
 			continue
 		}
 		matches = append(matches, e)
@@ -185,15 +186,50 @@ func Match(entries []Entry, reqs *provisionerv1.ResourceRequirements, mode Fabri
 // sizing facts: only filter here on what a catalog row genuinely bounds.
 
 // satisfiesFabric applies whichever of the fabric package's two verdicts this
-// provider has earned the right to. CouldSatisfy reads scope only, since a
-// bandwidth floor on a row we have not measured would be comparing a
+// provider has earned the right to. CouldSatisfy reads scope and width only,
+// since a bandwidth floor on a row we have not measured would be comparing a
 // requirement against a catalog figure the host may not deliver.
-func satisfiesFabric(family fabric.Family, reqs *provisionerv1.ResourceRequirements, mode FabricMode) bool {
+//
+// Both read the group's width, because an intra-node fabric has to join every
+// card asked for: four H100 NVL are two bridged pairs, not one fabric.
+func satisfiesFabric(family fabric.Family, reqs *provisionerv1.ResourceRequirements, gpuCount int32, mode FabricMode) bool {
 	if mode == FabricPrefilter {
-		return fabric.CouldSatisfy(family, reqs.GetFabricScope())
+		return fabric.CouldSatisfy(family, reqs.GetFabricScope(), gpuCount)
 	}
 	return fabric.Satisfies(
-		fabric.Resolve(fabric.Observation{Family: family}),
+		fabric.Resolve(fabric.Observation{Family: family, GpuCount: gpuCount}),
 		reqs.GetFabricScope(), reqs.GetMinFabricGbps(),
 	)
+}
+
+// SplitReason explains which catalog families an intra-node request refused
+// because their fabric is narrower than the group, or returns "" when it
+// refused none. Adapters append it to a no-match error so "no SKU satisfies"
+// says why, instead of leaving an operator to guess that four NVL cards are
+// two islands.
+func SplitReason(entries []Entry, reqs *provisionerv1.ResourceRequirements) string {
+	if reqs.GetFabricScope() != provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE {
+		return ""
+	}
+	var reasons []string
+	seen := map[fabric.Family]bool{}
+	for _, e := range entries {
+		if seen[e.Family] {
+			continue
+		}
+		seen[e.Family] = true
+		if r := fabric.SplitReason(e.Family, reqs.GetGpuCount()); r != "" {
+			reasons = append(reasons, r)
+		}
+	}
+	return strings.Join(reasons, "; ")
+}
+
+// SplitHint is SplitReason shaped as a suffix for an error message: empty
+// when nothing was refused for width, otherwise "; refused for fabric: ...".
+func SplitHint(entries []Entry, reqs *provisionerv1.ResourceRequirements) string {
+	if r := SplitReason(entries, reqs); r != "" {
+		return "; refused for fabric: " + r
+	}
+	return ""
 }
