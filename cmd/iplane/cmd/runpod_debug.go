@@ -31,10 +31,11 @@ RunPod account vs. what iplane has locally.`,
 
 var runpodDebugKeysCmd = &cobra.Command{
 	Use:   "debug-keys",
-	Short: "Print RunPod-side pubKey blob alongside the iplane-managed key",
-	Long: `Fetches the user's pubKey blob from RunPod's GraphQL endpoint and
-prints it next to iplane's local public key, so you can verify the
-two are aligned.
+	Short: "Print the RunPod account's SSH keys alongside the iplane-managed key",
+	Long: `Fetches the account's registered SSH keys from RunPod
+(GET https://api.runpod.io/v2/account/ssh-keys, read-only) and prints
+them next to iplane's local public key, so you can verify the two are
+aligned.
 
 Useful when 'iplane deployment deploy' fails with:
 
@@ -42,15 +43,15 @@ Useful when 'iplane deployment deploy' fails with:
 
 A mismatch (or stale lines) is one of the common causes.
 
-Requires RUNPOD_API_KEY in the environment (Full-scope key; the
-GraphQL endpoint is not covered by scoped rpa_ keys).`,
+Requires RUNPOD_API_KEY in the environment, with the
+authentication:read scope (Full access covers it).`,
 	RunE: runRunpodDebugKeys,
 }
 
 func runRunpodDebugKeys(cmd *cobra.Command, args []string) error {
 	apiKey := os.Getenv("RUNPOD_API_KEY")
 	if apiKey == "" {
-		return fmt.Errorf("RUNPOD_API_KEY is required (must be a Full-scope key; GraphQL is not in the rpa_ scope set)")
+		return fmt.Errorf("RUNPOD_API_KEY is required (needs the authentication:read scope; Full access covers it)")
 	}
 
 	dir, err := resolveStateDir()
@@ -75,7 +76,7 @@ func runRunpodDebugKeys(cmd *cobra.Command, args []string) error {
 	defer cancel()
 	blob, err := p.FetchUserPubKey(ctx)
 	if err != nil {
-		return fmt.Errorf("fetch runpod pubKey: %w", err)
+		return fmt.Errorf("fetch runpod ssh keys: %w", err)
 	}
 
 	out := cmd.OutOrStdout()
@@ -84,7 +85,7 @@ func runRunpodDebugKeys(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(out, "  pub line:   "+strings.TrimSpace(string(localPub)))
 	fmt.Fprintln(out)
 
-	fmt.Fprintln(out, "RunPod user pubKey blob ("+countLines(blob)+" lines):")
+	fmt.Fprintln(out, "RunPod account SSH keys ("+countLines(blob)+"):")
 	if blob == "" {
 		fmt.Fprintln(out, "  (empty)")
 	} else {

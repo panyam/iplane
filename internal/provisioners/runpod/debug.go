@@ -15,16 +15,18 @@ const EnvHTTPDebug = "IPLANE_RUNPOD_DEBUG"
 
 // EnvPhaseTrace enables cold-start phase tracing when set to any
 // non-empty value. Each engine-readiness tick prints the raw RunPod
-// status signals (elapsed, createdAt, lastStartedAt, machine presence,
-// derived phase) as a single TSV line to stderr, and the deployer keeps
-// polling pod status past engine-init instead of stopping there.
+// status signals (elapsed, createdAt, startedAt, status, machine
+// presence, container start, derived phase) as a single TSV line to
+// stderr, and the deployer keeps polling pod status past engine-init
+// instead of stopping there.
 //
-// This exists to diagnose issue 208: runpod:image-pull measures ~0s on
-// every run, and the suspicion is that RunPod stamps lastStartedAt at
-// pod creation rather than at container start, so classifyEnginePhase
-// jumps straight to engine:init on the first probe. The normal path
-// stops probing once engine-init is reached, which hides exactly the
-// evidence needed, hence the extra polling under this flag.
+// This was built to diagnose issue 208: runpod:image-pull measured ~0s
+// on every run because v1 stamped lastStartedAt at pod creation rather
+// than at container start, so classifyEnginePhase jumped straight to
+// engine:init on the first probe. The normal path stops probing once
+// engine-init is reached, which hides exactly the evidence needed, hence
+// the extra polling under this flag. It is also how to check the v2
+// signals (machinePresent in runpod.go) against a real deploy.
 //
 // Off by default and observability-only: it never changes phase
 // emission, readiness, or deploy outcome.
@@ -34,7 +36,7 @@ const EnvPhaseTrace = "IPLANE_RUNPOD_PHASE_TRACE"
 func phaseTraceEnabled() bool { return os.Getenv(EnvPhaseTrace) != "" }
 
 // emptyDash renders an empty string as "-" so a TSV phase-trace line
-// keeps its column alignment and an empty lastStartedAt is visually
+// keeps its column alignment and an empty startedAt is visually
 // distinct from a populated one.
 func emptyDash(s string) string {
 	if s == "" {

@@ -146,7 +146,7 @@ flatten to underscore (so `backend.engine` → `IPLANE_BACKEND_ENGINE`).
 | `IPLANE_OTEL_HEADERS`              | Comma-separated `KEY=VALUE` auth headers paired with `IPLANE_OTEL_ENDPOINT`. Required for hosted providers; unused for the tunnel. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`      | OTLP collector address for `iplane serve` itself (control-plane traces/metrics) |
 | `HF_TOKEN`                         | Propagated to engine pods for gated-model fetches; HF pre-flight check also uses it for gated-model existence probes |
-| `RUNPOD_API_KEY`                   | Required for `iplane instance create runpod ...` — must be a new-style scoped key (`rpa_...` prefix) with **Full** access (REST scope is NOT covered by legacy keys or `api.runpod.ai`-only scopes — both silently 401 on `rest.runpod.io/v1`) |
+| `RUNPOD_API_KEY`                   | Required for `iplane instance create runpod ...`. The adapter speaks only REST v2 (`api.runpod.io/v2`) since 2026-10; a scoped key needs `pods:read/write`, `catalog:read`, `volumes:read/write` and `authentication:read/write` (SSH keys), and Full access covers all of them. `make runpod-v2-check` verifies a key read-only |
 | `IPLANE_PROVIDER`                  | Default provider for CLI commands and demo binaries when `--provider` is omitted. Falls back to `runpod` if unset (preserves Ch 6 behavior). Example: `IPLANE_PROVIDER=vast iplane deployment deploy llama --model ...` |
 | `VAST_API_KEY`                     | Required when `IPLANE_PROVIDER=vast` (or `--provider vast`). Bearer-token auth on `console.vast.ai`. |
 | `IPLANE_VAST_MIN_INET_DOWN_MBPS`   | Lower bound on a Vast host's advertised download bandwidth, pushed into the offer search. Default 1000. `0` disables the floor. |
