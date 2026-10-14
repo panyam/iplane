@@ -115,8 +115,13 @@ func runDeploymentDeploy(cmd *cobra.Command, args []string) error {
 	id := args[0]
 	// The external provider attaches to an already-running engine, so
 	// it has no image to run.
-	if deployImage == "" && deployProvider != provisioners.ProviderExternal {
-		return fmt.Errorf("--image is required")
+	image := deployImage
+	if image == "" && deployProvider != provisioners.ProviderExternal {
+		image = defaultEngineImage
+	}
+	engineArgs, err := splitEngineArgs(deployEngineArgs)
+	if err != nil {
+		return err
 	}
 	if deployModel == "" {
 		return fmt.Errorf("--model is required")
@@ -189,10 +194,10 @@ func runDeploymentDeploy(cmd *cobra.Command, args []string) error {
 	dep := &provisionerv1.Deployment{
 		Id:               id,
 		InstanceId:       deployInstanceID,
-		Image:            deployImage,
+		Image:            image,
 		Model:            deployModel,
 		EnginePort:       deployEnginePort,
-		EngineArgs:       deployEngineArgs,
+		EngineArgs:       engineArgs,
 		EngineEntrypoint: deployEngineEntrypnt,
 		Env:              engineEnv,
 		DebugShell:       deployDebugShell,
@@ -282,7 +287,7 @@ func runDeploymentDeploy(cmd *cobra.Command, args []string) error {
 
 	resp, err := client.CreateDeployment(ctx, req)
 	if err != nil {
-		return fmt.Errorf("deploy %q: %w", id, err)
+		return deployTimeoutError(id, deployTimeout, deploymentServiceURL != "", ctx.Err(), err)
 	}
 
 	return renderDeployResult(cmd, resp)
@@ -315,7 +320,7 @@ func init() {
 	f.StringVar(&deployProvider, "provider", defaultProvider(""),
 		`provider to auto-provision on, e.g. runpod (required when --instance is omitted; falls back to `+EnvProvider+` env when unset)`)
 	f.StringVar(&deployRegion, "region", "", `region hint for auto-provisioning (optional)`)
-	f.StringVar(&deployImage, "image", "", `engine container image, e.g. vllm/vllm-openai:v0.27.1 (required)`)
+	f.StringVar(&deployImage, "image", "", `engine container image (default `+defaultEngineImage+`, the pinned engine)`)
 	f.StringVar(&deployModel, "model", "",
 		`HF model id, e.g. Qwen/Qwen2.5-1.5B-Instruct (required; see 'iplane deployment models' for a starter list)`)
 	f.StringSliceVar(&deployEngineEndpoints, "engine-endpoints", nil,
@@ -342,8 +347,7 @@ func init() {
 			`How the engine assembles across them is yours to say through --engine-args`)
 	f.Int32Var(&deployFabricBW, "min-fabric-gbps", 0, minFabricGbpsUsage)
 	f.Int32Var(&deployEnginePort, "engine-port", 8000, `port the engine listens on`)
-	f.StringSliceVar(&deployEngineArgs, "engine-args", nil,
-		`additional args passed to the engine entrypoint (comma-separated or repeated)`)
+	f.StringArrayVar(&deployEngineArgs, "engine-args", nil, engineArgsUsage)
 	f.StringToStringVar(&deployEnv, "env", nil,
 		`env var to set in the engine container, KEY=VALUE (repeatable)`)
 	f.StringSliceVar(&deployEngineEntrypnt, "engine-entrypoint", nil,
@@ -364,8 +368,8 @@ func init() {
 	f.BoolVar(&deployDebugShell, "debug-shell", false,
 		`opt in to shell-level access to the engine pod (allocates a routable IP + ssh; costs more, narrows placement). Engine endpoint is unchanged either way.`)
 	f.BoolVar(&deployWait, "wait", true, `block until the engine reaches a terminal state`)
-	f.DurationVar(&deployTimeout, "timeout", 8*time.Minute,
-		`maximum time to wait for the engine to reach a terminal state (only with --wait)`)
+	f.DurationVar(&deployTimeout, "timeout", defaultDeployTimeout,
+		`maximum time to wait for the engine to reach a terminal state (only with --wait). A large model's cold start is mostly its weight download, so a 70B can take 20-30 minutes and a frontier MoE longer`)
 	f.BoolVar(&deployDryRun, "dry-run", false,
 		`print the planned action and exit without provisioning`)
 }
