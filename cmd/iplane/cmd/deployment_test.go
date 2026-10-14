@@ -417,6 +417,7 @@ func TestDeploy_DryRun_ShowsTheVastEntrypoint(t *testing.T) {
 		"entrypoint:  python3 -m vllm.entrypoints.openai.api_server",
 		`"--max-model-len" "16384" "--max-num-seqs" "16"`,
 		defaultEngineImage,
+		"pre-flight:  runs before renting, unless the checkpoint is published pre-quantized",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("dry-run output missing %q; got:\n%s", want, out)
@@ -435,6 +436,26 @@ func TestDeploy_DryRun_ShowsTheVastEntrypoint(t *testing.T) {
 	}
 	if !strings.Contains(out, "entrypoint:  WOULD BE REFUSED") {
 		t.Errorf("dry-run should refuse an image vast cannot start; got:\n%s", out)
+	}
+}
+
+// Without --sku the daemon has no exact card capacity and the VRAM
+// pre-flight steps aside. The preview says so instead of letting it read
+// as a pass.
+func TestDeploy_DryRun_SaysThePreflightNeedsASKU(t *testing.T) {
+	env := newDeploymentTestEnv(t)
+	out, err := runDeploymentCmd(t, env,
+		"deploy", "big",
+		"--provider", "vast", "--min-vram-gb", "80", "--gpu-count", "2",
+		"--model", "Qwen/Qwen2.5-72B-Instruct",
+		"--engine-args", "--max-model-len=16384 --max-num-seqs=16",
+		"--dry-run",
+	)
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "pre-flight:  will not run: it needs an exact --sku") {
+		t.Errorf("dry-run should say the pre-flight will not run; got:\n%s", out)
 	}
 }
 
