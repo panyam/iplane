@@ -36,6 +36,11 @@ smoke-runpod: ## Provision a real RunPod pod ($0.05 ish) -- requires RUNPOD_API_
 	@test -n "$$RUNPOD_API_KEY" || (echo "RUNPOD_API_KEY not set" && exit 1)
 	go test -tags=smoke_runpod -v -count=1 -timeout=5m ./tests/smoke-runpod/...
 
+.PHONY: runpod-v2-check
+runpod-v2-check: ## Read-only check of the RunPod adapter against the live v2 API (pods, ssh-keys; GETs only, free) -- requires RUNPOD_API_KEY
+	@test -n "$$RUNPOD_API_KEY" || (echo "RUNPOD_API_KEY not set" && exit 1)
+	go test -tags=runpod_readonly -run '^TestRunPodReadOnly_' -v -count=1 -timeout=3m ./tests/smoke-runpod/...
+
 load: ## Generate synthetic traffic against the running stack (safe with mock backend)
 	go run ./cmd/iplane load --url=http://localhost:8080
 
