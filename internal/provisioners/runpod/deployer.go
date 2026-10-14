@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 
-	skhttp "github.com/panyam/servicekit/http"
-
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
 	"github.com/inference-book/inference-plane/internal/provisioners"
 	"github.com/inference-book/inference-plane/internal/sshkeys"
@@ -52,22 +50,14 @@ func (p *Provider) Deploy(ctx context.Context, dep *provisionerv1.Deployment, in
 		ProgressMessage: fmt.Sprintf("spawning pod with image %s", dep.GetImage()),
 	})
 
-	podReq, err := buildEnginePodRequest(dep, inst)
+	podReq, tries, err := buildEnginePodRequest(dep, inst)
 	if err != nil {
 		return failedf(emit, "runpod:create-pod", err)
 	}
 
-	req, err := p.client.newReq("POST", "/pods", nil, podReq)
+	created, _, err := p.createPod(ctx, "deploy", podReq, tries)
 	if err != nil {
-		return failedf(emit, "runpod:create-pod", fmt.Errorf("build request: %w", err))
-	}
-	created, err := skhttp.Call[createPodResponse](ctx, req, p.client.callOpts()...)
-	if err != nil {
-		return failedf(emit, "runpod:create-pod", wrapErr("deploy", err))
-	}
-	if created.ID == "" {
-		return failedf(emit, "runpod:create-pod",
-			fmt.Errorf("runpod returned empty pod id (likely no capacity for any of skus %v)", podReq.GPUTypeIDs))
+		return failedf(emit, "runpod:create-pod", err)
 	}
 
 	emit(provisioners.DeployStateUpdate{
@@ -96,7 +86,7 @@ func (p *Provider) Deploy(ctx context.Context, dep *provisionerv1.Deployment, in
 	return nil
 }
 
-// Destroy terminates the engine pod via DELETE /pods/{id}.
+// Destroy terminates the engine pod via DELETE /v2/pods/{id}.
 // Idempotent: 404 from RunPod is treated as success (already gone).
 func (p *Provider) Destroy(ctx context.Context, dep *provisionerv1.Deployment, _ *provisionerv1.Instance, _ *sshkeys.KeyPair, emit func(provisioners.DeployStateUpdate)) error {
 	podID := dep.GetContainerId()
@@ -129,36 +119,36 @@ func (p *Provider) Destroy(ctx context.Context, dep *provisionerv1.Deployment, _
 }
 
 // buildEnginePodRequest assembles the createPodRequest for the engine
-// pod. The instance's GPU SKU is inherited (the operator already
-// picked the class when provisioning the instance record); the
-// engine image + model + env come from the Deployment.
-func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.Instance) (createPodRequest, error) {
-	// SKU resolution. RunPod's `gpuTypeIds` accepts a SET of acceptable
-	// SKUs and lets the platform pick one with capacity, so we hand it
-	// the full cheapest-first match list (with `gpuTypePriority=AVAILABILITY`
-	// as a tie-breaker hint). Three cases:
+// pod, plus the placements createPod should try it at. The instance's GPU
+// SKU is inherited (the operator already picked the class when
+// provisioning the instance record); the engine image + model + env come
+// from the Deployment.
+func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.Instance) (createPodRequest, []podPlacement, error) {
+	// SKU resolution. v2 places one GPU type per create, so the
+	// cheapest-first match list becomes the order createPod walks rather
+	// than a set RunPod picks from. Three cases:
 	//   - explicit instance with a resolved SKU: pin to it (the
 	//     operator picked this exact GPU at instance-create time).
 	//   - auto-provisioned instance with reqs.Sku set: also pin
 	//     (operator forced an exact SKU via --sku).
-	//   - auto-provisioned instance with class / min-vram: pass the
-	//     whole MatchSKUs list so RunPod can route to any SKU with
-	//     free capacity, not just the cheapest. Mitigates the common
-	//     "no capacity on A5000 right now" 500.
+	//   - auto-provisioned instance with class / min-vram: try the
+	//     whole MatchSKUs list so a deploy lands on any SKU with free
+	//     capacity, not just the cheapest. Mitigates the common
+	//     "no capacity on A5000 right now" refusal.
 	var gpuSKUs []string
 	if sku := inst.GetGpu().GetSku(); sku != "" {
 		gpuSKUs = []string{sku}
 	} else {
 		reqs := inst.GetSpec().GetRequirements()
 		if reqs == nil {
-			return createPodRequest{}, fmt.Errorf("instance has neither a resolved GPU SKU nor resource requirements to resolve one")
+			return createPodRequest{}, nil, fmt.Errorf("instance has neither a resolved GPU SKU nor resource requirements to resolve one")
 		}
 		if sku := reqs.GetSku(); sku != "" {
 			gpuSKUs = []string{sku}
 		} else if matches := MatchSKUs(reqs); len(matches) > 0 {
 			gpuSKUs = matches
 		} else {
-			return createPodRequest{}, fmt.Errorf("no runpod SKU satisfies the deployment's requirements (min_vram_gb=%d)", reqs.GetMinVramGb())
+			return createPodRequest{}, nil, fmt.Errorf("no runpod SKU satisfies the deployment's requirements (min_vram_gb=%d)", reqs.GetMinVramGb())
 		}
 	}
 
@@ -178,9 +168,8 @@ func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.In
 	// Build the docker CMD. vLLM (and most OpenAI-compat engines) take
 	// `--model X --host 0.0.0.0 --port N` plus the operator's custom
 	// args. The image ENTRYPOINT is the engine binary; we REPLACE the
-	// image CMD with this argv via RunPod's dockerStartCmd field. The
-	// legacy single-string `dockerArgs` was removed from RunPod's REST
-	// schema; argv tokens go on the wire as a JSON array.
+	// image CMD with this argv via v2's `cmd` (exec form, a JSON array,
+	// not a shell-split string).
 	cmd := []string{
 		"--model", dep.GetModel(),
 		"--host", "0.0.0.0",
@@ -198,36 +187,39 @@ func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.In
 		gpuCount = 1
 	}
 
-	return createPodRequest{
-		Name:              "iplane-engine-" + dep.GetId(),
-		ImageName:         dep.GetImage(),
-		GPUTypeIDs:        gpuSKUs,
-		GPUTypePriority:   "availability",
-		GPUCount:          gpuCount,
-		ContainerDiskInGB: defaultContainerDiskGB,
-		VolumeInGB:        defaultVolumeGB,
-		ComputeType:       defaultComputeType,
+	// A debug shell needs a reachable sshd, which keeps the pod on the
+	// SECURE cloud (see the cloud comment in runpod.go); the proxy-only
+	// default can take either.
+	clouds := anyCloud
+	if dep.GetDebugShell() {
+		clouds = sshClouds
+	}
+
+	req := createPodRequest{
+		Name:  "iplane-engine-" + dep.GetId(),
+		Image: dep.GetImage(),
+		GPU:   &createGPU{Count: gpuCount},
+		Disk:  defaultContainerDiskGB,
 		// RunPod port suffixes:
 		//   /http -> reverse-proxied at
 		//            https://<pod-id>-<port>.proxy.runpod.net.
-		//            No publicIp needed; absent from portMappings.
-		//            Free; works on community capacity.
-		//   /tcp  -> NAT-mapped onto pod.publicIp; appears in
-		//            pod.portMappings[<internal>] = <external>.
-		//            Needs supportPublicIp; bills extra; restricts
-		//            placement to publicIp-capable hosts.
+		//            No public IP needed. Free; works on community
+		//            capacity.
+		//   /tcp  -> NAT-mapped onto a public IP and port, published as
+		//            ssh.direct for 22. Needs a host with a public IP.
 		// Cost-aware default: engine port is /http (proxy URL). SSH is
 		// /tcp but only added when the operator opts in via debug_shell
-		// -- otherwise we'd allocate a publicIp the workload doesn't
-		// need and lose the cheapest community capacity in the catalog.
-		Ports:          enginePodPorts(enginePort, dep.GetDebugShell()),
-		SupportPublicIP: dep.GetDebugShell(),
-		Env:             env,
-		DockerStartCmd:  cmd,
-	}, nil
+		// -- otherwise we'd narrow placement for a port the workload
+		// doesn't need and lose the cheapest community capacity.
+		Ports:    enginePodPorts(enginePort, dep.GetDebugShell()),
+		StartSSH: dep.GetDebugShell(),
+		Env:      env,
+		Cmd:      cmd,
+	}
+	return req, gpuPlacements(gpuSKUs, clouds), nil
 }
 
-// enginePodPorts returns the Ports list for POST /pods. Engine port is
+// enginePodPorts returns the ports list for POST /pods. Engine port is
 // always /http (proxy-routed); SSH is /tcp and only added when the
 // operator asked for debug-shell access.
 func enginePodPorts(enginePort int32, debugShell bool) []string {

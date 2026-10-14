@@ -1,6 +1,7 @@
 package runpod
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,9 +14,15 @@ import (
 	skhttp "github.com/panyam/servicekit/http"
 )
 
-// Default endpoint for the RunPod REST API. Overrideable via WithBaseURL
-// (httptest in unit tests, staging in integration tests).
-const DefaultBaseURL = "https://rest.runpod.io/v1"
+// DefaultBaseURL is RunPod's REST API v2. Every call this adapter makes
+// goes here: pods and account SSH keys. Overrideable via WithBaseURL
+// (httptest in unit tests).
+//
+// Until 2026-10 the adapter spoke two surfaces: REST v1 at
+// rest.runpod.io/v1 for pods and GraphQL at api.runpod.io/graphql for SSH
+// keys. RunPod retires REST v1 on 2026-11-15 and GraphQL in early 2027,
+// and v2 covers both, so it is the only one left.
+const DefaultBaseURL = "https://api.runpod.io/v2"
 
 // Client carries the bits every RunPod request needs (base URL, bearer
 // token) plus an optional custom *http.Client for tests. The actual
@@ -36,8 +43,9 @@ func WithHTTPClient(c *http.Client) ClientOption {
 	return func(cl *Client) { cl.httpClient = c }
 }
 
-// WithBaseURL points the client at a different endpoint. Tests pass the
-// httptest.Server URL; staging tests point at a staging endpoint.
+// WithBaseURL points the client at a different endpoint, including the
+// version segment (production is https://api.runpod.io/v2). Tests pass
+// the httptest.Server URL plus "/v2" so fakes match the real paths.
 func WithBaseURL(u string) ClientOption {
 	return func(cl *Client) { cl.baseURL = strings.TrimRight(u, "/") }
 }
@@ -107,9 +115,46 @@ func (c *Client) callOpts() []skhttp.CallOption {
 	return nil
 }
 
+// pagination is v2's cursor block, carried by every list response.
+type pagination struct {
+	NextCursor  *string `json:"nextCursor"`
+	HasNextPage bool    `json:"hasNextPage"`
+}
+
+// maxListPages bounds a paginated walk. Pages default to 1000 items, so
+// this is a guard against a cursor that never terminates rather than a
+// limit anyone should reach.
+const maxListPages = 100
+
+// listAll walks a cursor-paginated v2 list endpoint and returns every
+// item. page extracts the items and the pagination block from one
+// decoded response, since each endpoint wraps its list under its own key
+// ({"pods": [...]}, {"networkVolumes": [...]}).
+func listAll[R, T any](ctx context.Context, c *Client, op, path string, page func(R) ([]T, pagination)) ([]T, error) {
+	q := url.Values{}
+	var out []T
+	for i := 0; i < maxListPages; i++ {
+		req, err := c.newReq("GET", path, q, nil)
+		if err != nil {
+			return nil, wrapErr(op, err)
+		}
+		resp, err := skhttp.Call[R](ctx, req, c.callOpts()...)
+		if err != nil {
+			return nil, wrapErr(op, err)
+		}
+		items, pg := page(resp)
+		out = append(out, items...)
+		if !pg.HasNextPage || pg.NextCursor == nil || *pg.NextCursor == "" {
+			return out, nil
+		}
+		q.Set("cursor", *pg.NextCursor)
+	}
+	return nil, wrapErr(op, fmt.Errorf("%s did not finish paginating after %d pages", path, maxListPages))
+}
+
 // wrapErr translates a servicekit HTTPError into a *provisioners.ProviderError
-// with RunPod's array-shaped error body parsed. Preserves the raw body via
-// the wrapped cause so the original message reaches the operator.
+// with RunPod's problem+json body parsed. Preserves the detail text so the
+// original message reaches the operator.
 func wrapErr(op string, err error) error {
 	if err == nil {
 		return nil
@@ -129,54 +174,59 @@ func wrapErr(op string, err error) error {
 	return provisioners.NewProviderError(provisioners.ProviderRunPod, op, err, 0)
 }
 
-// errorBody is the single-object form of RunPod's error response. The
-// array form is handled in parseErrorMessage. `problems` is RunPod's
-// per-field validation list (set on 4xx schema rejections); it carries
-// the actually-actionable signal while `error` is the generic envelope.
-type errorBody struct {
-	Error    string   `json:"error"`
-	Message  string   `json:"message"`
-	Problems []string `json:"problems,omitempty"`
+// problemBody is v2's error shape, RFC 9457 problem+json:
+// {title, status, detail, errors[]}. `errors` lists individual
+// validation failures on a 422 and is the actionable part when present.
+//
+// Error and Message are not part of v2's schema. They catch the bodies
+// v1 used to send, in case anything upstream of the v2 handler (a proxy,
+// a gateway) still answers in that shape.
+type problemBody struct {
+	Title   string   `json:"title"`
+	Status  int      `json:"status"`
+	Detail  string   `json:"detail"`
+	Errors  []string `json:"errors"`
+	Error   string   `json:"error"`
+	Message string   `json:"message"`
 }
 
-// parseErrorMessage extracts a useful message from RunPod's error
-// response shape. RunPod is inconsistent across endpoints -- some
-// return `{"error": "..."}`, some `{"message": "..."}`, some return
-// an array `[{"error": "...", "problems": [...]}]`, some plain text.
-// `problems` (when present) carries the actionable per-field validator
-// output; we prefer it over the generic envelope. Errors are the
-// operator's actionable signal -- never truncate them.
+// parseErrorMessage extracts the operator-facing message from a RunPod
+// error body. detail first, then each validation error, so a 422 reads
+// "Request validation failed.: $.gpu.id: ...". Falls back to title, then
+// to the v1-era keys, then to the raw body. Errors are the operator's
+// actionable signal -- never truncate them.
 func parseErrorMessage(body []byte) string {
-	render := func(e errorBody) string {
-		if len(e.Problems) > 0 {
-			return strings.Join(e.Problems, "; ")
+	var p problemBody
+	if err := json.Unmarshal(body, &p); err == nil {
+		var parts []string
+		if p.Detail != "" {
+			parts = append(parts, p.Detail)
 		}
-		if e.Error != "" {
-			return e.Error
-		}
-		return e.Message
-	}
-
-	// Single-object form: {"error": "..."} or {"message": "..."}.
-	var single errorBody
-	if err := json.Unmarshal(body, &single); err == nil {
-		if msg := render(single); msg != "" {
-			return msg
-		}
-	}
-	// Array form: [{"error": "...", "problems": [...]}, ...]. RunPod's
-	// OpenAPI validator uses this for schema rejections.
-	var arr []errorBody
-	if err := json.Unmarshal(body, &arr); err == nil && len(arr) > 0 {
-		parts := make([]string, 0, len(arr))
-		for _, e := range arr {
-			if msg := render(e); msg != "" {
-				parts = append(parts, msg)
-			}
+		if len(p.Errors) > 0 {
+			parts = append(parts, strings.Join(p.Errors, "; "))
 		}
 		if len(parts) > 0 {
-			return strings.Join(parts, "; ")
+			return strings.Join(parts, ": ")
+		}
+		for _, s := range []string{p.Title, p.Error, p.Message} {
+			if s != "" {
+				return s
+			}
 		}
 	}
 	return string(body)
+}
+
+// httpStatus returns the HTTP status behind err, or 0 when the failure
+// never reached a response (DNS, dial, timeout).
+func httpStatus(err error) int {
+	var httpErr *skhttp.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Code
+	}
+	var pe *provisioners.ProviderError
+	if errors.As(err, &pe) {
+		return pe.HTTP
+	}
+	return 0
 }
