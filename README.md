@@ -96,4 +96,4 @@ top, both calling the same in-process gRPC server. See
 
 ## License
 
-Apache 2.0. See `LICENSE`.
+MIT. See `LICENSE`.
