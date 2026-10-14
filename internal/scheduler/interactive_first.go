@@ -367,6 +367,7 @@ func (s *InteractiveFirst) dispatch(lane string, e Entry) {
 	}
 	slots := s.slotsFor(deploymentID)
 	if !slots.acquire(s.rootCtx, s.inFlightCap*replicasFromEntry(e)) {
+		reject(e) // Stop ran while this entry waited for a slot
 		return
 	}
 	// Tracked on wg so Stop drains handed-off requests as well as
@@ -405,7 +406,32 @@ func (s *InteractiveFirst) Stop() {
 	s.interactive.close()
 	s.batch.close()
 	s.rootCancel()
+	// Workers exit on the cancel without draining the lanes, so
+	// whatever is still queued will never dispatch. Reject it now
+	// rather than after wg.Wait, so those callers are not held until
+	// the in-flight requests finish.
+	s.rejectQueued(s.interactive)
+	s.rejectQueued(s.batch)
 	s.wg.Wait()
+}
+
+// rejectQueued empties a closed lane, rejecting each entry. A worker
+// that has not yet seen the cancel may pop concurrently; each entry is
+// popped exactly once, so it is either dispatched there or rejected
+// here.
+func (s *InteractiveFirst) rejectQueued(ls *laneState) {
+	for {
+		e, err := ls.tryPop(context.Background())
+		switch {
+		case err == nil:
+			reject(e)
+		case errors.Is(err, queue.ErrClosed):
+			return
+		default:
+			// Lost a race for the last item; look again.
+			time.Sleep(time.Millisecond)
+		}
+	}
 }
 
 // Len returns the current waiting depth on the named lane (sum
