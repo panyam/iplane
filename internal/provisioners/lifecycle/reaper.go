@@ -130,8 +130,8 @@ func (r *Reaper) Run(ctx context.Context) {
 //
 // Two reap paths:
 //
-//   - RUNNING deployments whose idle TTL has elapsed: the original
-//     leak-protection sweep.
+//   - RUNNING or DEGRADED deployments whose idle TTL has elapsed: the
+//     original leak-protection sweep.
 //   - TERMINATING deployments: previous destroy attempts hit a
 //     transient error (issue 165). Each sweep increments an in-memory
 //     retry counter; after MaxDestroyRetries the reaper gives up
@@ -211,10 +211,12 @@ func (r *Reaper) destroy(ctx context.Context, dep *provisionerv1.Deployment, rea
 // shouldReap encapsulates the reap policy. Documented in plain English
 // because the chapter prose teaches this exact decision tree:
 //
-//   - state must be RUNNING. Destroying a STARTING/CONFIGURING
-//     deployment would clobber an in-progress deploy; FAILED /
-//     TERMINATED / TERMINATING are already done; DEGRADED stays for
-//     operator diagnostics.
+//   - state must be RUNNING or DEGRADED, the two states that serve
+//     traffic and bill for it. DEGRADED keeps serving on its healthy
+//     replicas, so an idle one is the same leak as an idle RUNNING
+//     one. Destroying a STARTING/CONFIGURING deployment would clobber
+//     an in-progress deploy; FAILED / TERMINATED / TERMINATING are
+//     already done.
 //   - idle_ttl_seconds must be > 0. Zero means "no TTL set", the
 //     v0.2 default that preserves v0.1 behavior (no reaping unless
 //     operator opts in).
@@ -236,13 +238,16 @@ func (r *Reaper) destroy(ctx context.Context, dep *provisionerv1.Deployment, rea
 //   - FAILED: the deployer hit a permanent error (auth, validation).
 //     Retrying won't help; operator action is required. Issue 165
 //     follow-up may add a separate "force destroy" path.
-//   - RUNNING: handled by shouldReap. Don't double-dispatch.
+//   - RUNNING / DEGRADED: handled by shouldReap. Don't double-dispatch.
 func (r *Reaper) shouldRetry(dep *provisionerv1.Deployment) bool {
 	return dep.GetState() == provisionerv1.DeploymentState_DEPLOYMENT_STATE_TERMINATING
 }
 
 func (r *Reaper) shouldReap(dep *provisionerv1.Deployment, now time.Time) bool {
-	if dep.GetState() != provisionerv1.DeploymentState_DEPLOYMENT_STATE_RUNNING {
+	switch dep.GetState() {
+	case provisionerv1.DeploymentState_DEPLOYMENT_STATE_RUNNING,
+		provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED:
+	default:
 		return false
 	}
 	if dep.GetIdleTtlSeconds() <= 0 {
