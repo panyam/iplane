@@ -110,9 +110,9 @@ func (p *Provider) Deploy(ctx context.Context, dep *provisionerv1.Deployment, in
 		ContainerID:     contractID,
 	})
 
-	endpoint, err := p.waitForEngineReady(ctx, rented.NewContract, enginePort, emit)
+	endpoint, err := p.waitForEngineReadyWithin(ctx, rented.NewContract, enginePort, p.engineReadyTimeoutFor(diskGB), emit)
 	if err != nil {
-		return deployFailed(emit, "vast:engine-ready", err)
+		return deployFailed(emit, "vast:engine-ready", withDiskFullHint(err, diskGB, reqs.GetMinDiskGb() > 0))
 	}
 
 	emit(provisioners.DeployStateUpdate{
@@ -268,7 +268,35 @@ func agentPrelude(dep *provisionerv1.Deployment) string {
 // the engine onto only once the container is running, so this waits for the
 // mapping to appear and then for the engine behind it to serve.
 func (p *Provider) waitForEngineReady(ctx context.Context, contractID int, enginePort int32, emit func(provisioners.DeployStateUpdate)) (string, error) {
-	timeout := p.engineReadyTimeout
+	return p.waitForEngineReadyWithin(ctx, contractID, enginePort, p.engineReadyTimeout, emit)
+}
+
+// engineReadyTimeoutFor scales the engine-ready deadline with the container
+// disk, which is sized from the checkpoint when the model store knows it.
+//
+// A fixed 30 minutes holds a small model and not a frontier one: a 474 GB
+// checkpoint at the 1000 Mbps floor is over an hour of download alone. The
+// scale is ten minutes for the image and the load plus the disk at
+// 100 MB/s, a rate the bandwidth floor clears, so 200 GB waits about 43
+// minutes and 570 GB about 105. A host too slow for even that is caught by
+// the slow-download abort, which projects the measured rate against this
+// deadline, rather than by the deadline itself.
+//
+// Only the built-in default scales. A timeout the operator set through
+// IPLANE_ENGINE_READY_TIMEOUT is used as given.
+func (p *Provider) engineReadyTimeoutFor(diskGB int) time.Duration {
+	base := p.engineReadyTimeout
+	if base <= 0 {
+		base = defaultEngineReadyTimeout
+	}
+	if p.engineReadyTimeoutSet || base != defaultEngineReadyTimeout {
+		return base
+	}
+	scaled := 10*time.Minute + time.Duration(diskGB)*10*time.Second
+	return max(base, scaled)
+}
+
+func (p *Provider) waitForEngineReadyWithin(ctx context.Context, contractID int, enginePort int32, timeout time.Duration, emit func(provisioners.DeployStateUpdate)) (string, error) {
 	if timeout <= 0 {
 		timeout = defaultEngineReadyTimeout
 	}
@@ -283,6 +311,7 @@ func (p *Provider) waitForEngineReady(ctx context.Context, contractID int, engin
 			Ordinal:     enginePhaseOrdinal,
 			Description: enginePhaseDescription,
 		},
+		TimeoutHint: engineReadyTimeoutHint,
 		Observe: func(ctx context.Context, _ string) enginewait.Observation {
 			api, derr := p.describeContract(ctx, contractID)
 			if derr != nil {
@@ -368,6 +397,26 @@ func endpointFromInstance(api *apiInstance, enginePort int32) (string, string) {
 // than the SSH wait because it covers the image pull and the model load, and
 // a large model's weights dominate both.
 const defaultEngineReadyTimeout = 30 * time.Minute
+
+// engineReadyTimeoutHint names the setting behind the engine-ready deadline.
+// It is the daemon's, so the CLI's --timeout cannot extend it.
+const engineReadyTimeoutHint = "this deadline is the control plane's (30m, scaled up with the container disk past 120 GB); " +
+	"raise IPLANE_ENGINE_READY_TIMEOUT where it runs, since the CLI's --timeout does not extend it"
+
+// withDiskFullHint adds the remedy to an engine that died because the
+// container disk filled. The engine's own words ("No space left on device")
+// arrive in the logs appended to err, and say what happened without saying
+// which flag fixes it or whether the size was chosen or defaulted.
+func withDiskFullHint(err error, diskGB int, sized bool) error {
+	if !strings.Contains(strings.ToLower(err.Error()), "no space left on device") {
+		return err
+	}
+	if sized {
+		return fmt.Errorf("%w\nthe %d GB container disk filled: raise --min-disk-gb above %d", err, diskGB, diskGB)
+	}
+	return fmt.Errorf("%w\nthe %d GB container disk filled. That is vast's default, used because the model store "+
+		"could not report this checkpoint's size: pass --min-disk-gb with room for the weights plus about 40 GB for the engine image", err, diskGB)
+}
 
 // deployFailed emits a terminal failure and returns the error, so callers
 // report the same reason the state file records.

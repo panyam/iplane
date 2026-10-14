@@ -115,6 +115,9 @@ type Provider struct {
 	// /health. Separate from the SSH wait because it covers the image pull
 	// and the model load, which a large model dominates.
 	engineReadyTimeout time.Duration
+	// engineReadyTimeoutSet records that the operator chose the timeout,
+	// which turns off scaling it with the container disk.
+	engineReadyTimeoutSet bool
 
 	// minInetDownMbps / minReliability are the marketplace-quality floors
 	// applied to every offer search. 0 disables that floor. See
@@ -170,6 +173,7 @@ func WithEngineReadyTimeout(d time.Duration) Option {
 	return func(p *Provider) {
 		if d > 0 {
 			p.engineReadyTimeout = d
+			p.engineReadyTimeoutSet = true
 		}
 	}
 }
