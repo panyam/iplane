@@ -35,22 +35,26 @@ deployment:
   instance_id: ""
 
 router:
-  # Demo 06 override: scheduler ON with enough dispatcher concurrency
-  # (servicers=16) that all replicas can be busy simultaneously. The
-  # chapter's narrative is "throughput scales with replicas"; if
-  # `servicers` is smaller than the number of replicas, the scheduler
-  # caps dispatch and adding replicas doesn't help -- the queue
-  # becomes the bottleneck instead of the engines.
+  # Demo 06 override: scheduler ON with a per-replica in-flight cap.
+  # The chapter's narrative is "throughput scales with replicas", so
+  # the router's concurrency has to grow with the replica count:
+  # in_flight_cap is per replica, and a deployment may have
+  # in_flight_cap x (healthy replicas) requests at the engines.
+  #
+  # in_flight_cap must be > 0 here. At 0 the scheduler's workers
+  # carry each request for its whole round trip R, so the worker
+  # count is a global ceiling of servicers / R requests per second
+  # however many replicas there are, and the curve stays flat. With a
+  # cap the workers only dispatch and servicers no longer bounds
+  # throughput.
   #
   # Demo 05's narrative wants the opposite (small dispatcher window
   # so the queue actually builds and priority lanes are visible);
-  # that's why 05's config keeps servicers=2 while 06 bumps it.
-  # in_flight_cap stays 0 (unlimited per-deployment); the only cap
-  # is the scheduler's worker pool.
+  # that's why 05's config keeps servicers=2 and no cap.
   queue:
     servicers: 16
     capacity: 256
-    in_flight_cap: 0
+    in_flight_cap: 4
     interactive:
       servicers: 16
       capacity: 256

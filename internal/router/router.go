@@ -261,9 +261,13 @@ func WithBatchQueue(servicers, capacity int) Option {
 	}
 }
 
-// WithInFlightCap sets the per-deployment in-flight concurrency
-// cap on the default scheduler. Mirrors the engine's max-num-seqs;
-// 0 means unlimited (workers themselves are the only bound).
+// WithInFlightCap sets the per-replica in-flight concurrency cap on
+// the default scheduler. Mirrors the engine's max-num-seqs, which is
+// per engine, so a deployment may have cap x (routable replicas) in
+// flight. With a cap the scheduler's workers hand requests off rather
+// than carrying them, and concurrency scales with replicas instead of
+// stopping at the worker count. 0 means unlimited (workers themselves
+// are the only bound, globally).
 // Ignored if no scheduler is configured (direct-forward path
 // doesn't enforce a cap; engine's own bound applies).
 func WithInFlightCap(cap int) Option {

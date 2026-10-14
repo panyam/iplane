@@ -127,12 +127,16 @@ If the gap doesn't appear, check:
    replicas=1 row shows `actual / target` close to 1.0, the
    script prints a warning. Bump `DEMO_RPS` until the baseline
    row drops below ~0.85.
-3. **In-flight cap isn't unlimited.** `router.queue.in_flight_cap`
-   bounds concurrent engine requests per deployment. If it's set
-   high enough that one replica can absorb the demo load, you
-   won't see the queue grow at the baseline. The default
-   (`in_flight_cap: 4`) is the right shape; bump only if your
-   engine is sized for it.
+3. **In-flight cap is set, and not too high.** `router.queue.in_flight_cap`
+   bounds concurrent engine requests per replica, so a deployment
+   gets `in_flight_cap` x its healthy replicas. It must be above 0:
+   at 0 the scheduler's `servicers` workers each hold a request for
+   its full round trip and cap the whole router at `servicers / R`
+   requests per second, so the curve stays flat however many
+   replicas you add. If it's set high enough that one replica can
+   absorb the demo load, you won't see the queue grow at the
+   baseline. The demo's `in_flight_cap: 4` is the right shape; bump
+   only if your engine is sized for it.
 
 ## See also
 
