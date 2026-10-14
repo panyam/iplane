@@ -97,12 +97,18 @@ func (p *Provider) Spawn(ctx context.Context, spec *provisionerv1.Spec) (*provis
 	}, nil
 }
 
-// checkConstraints rejects requirements the laptop cannot satisfy.
-// Only min_vram_gb is enforced -- min_disk_gb and min_ram_gb are
+// checkConstraints rejects requirements the laptop cannot satisfy:
+// VRAM, card count and fabric. min_disk_gb and min_ram_gb are
 // best-effort on the laptop (we don't know how much free disk/RAM
 // the operator has at a given moment, and the deploy primitive will
-// fail loudly anyway if there's not enough). VRAM is the
-// load-bearing constraint for engine viability.
+// fail loudly anyway if there's not enough).
+//
+// Card count and fabric used to go unchecked, so `--gpu-count 8
+// --fabric intra-node` succeeded on a one-GPU laptop. The count is
+// what was detected, with a floor of one so a CPU-only host still
+// runs the CPU path. The fabric fails closed for any stated scope but
+// NONE, because this provider reports no fabric at all and every
+// other provider treats an unreported fabric the same way.
 func (p *Provider) checkConstraints(reqs *provisionerv1.ResourceRequirements) error {
 	if reqs == nil {
 		return nil
@@ -110,6 +116,16 @@ func (p *Provider) checkConstraints(reqs *provisionerv1.ResourceRequirements) er
 	if v := int(reqs.GetMinVramGb()); v > 0 && v > p.detected.vramGB {
 		return fmt.Errorf("min_vram_gb=%d exceeds detected GPU (%s, %d GB) -- pick a smaller class or move to provider=runpod",
 			v, p.detected.sku, p.detected.vramGB)
+	}
+	have := max(p.detected.count, 1)
+	if n := int(reqs.GetGpuCount()); n > have {
+		return fmt.Errorf("gpu_count=%d exceeds the %d GPU(s) detected on this host (%s) -- lower --gpu-count or move to a cloud provider",
+			n, have, p.detected.sku)
+	}
+	if s := reqs.GetFabricScope(); s != provisionerv1.FabricScope_FABRIC_SCOPE_UNSPECIFIED &&
+		s != provisionerv1.FabricScope_FABRIC_SCOPE_NONE {
+		return fmt.Errorf("fabric_scope=%s cannot be vouched for: the local provider reports no GPU fabric, so a stated fabric fails closed -- drop --fabric or move to a cloud provider",
+			s)
 	}
 	return nil
 }

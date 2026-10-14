@@ -84,7 +84,11 @@ var skus = []SKUSpec{
 	// XL (>=94 GB VRAM): frontier / 400B-class multi-host.
 	{GpuTypeID: "NVIDIA H100 NVL", VRAMGb: 94, DefaultSystemRAMGb: 128, DefaultDiskGb: 100, PriceUSDPerHour: 2.99, Family: fabric.FamilyH100NVL},
 	{GpuTypeID: "NVIDIA H200", VRAMGb: 141, DefaultSystemRAMGb: 192, DefaultDiskGb: 100, PriceUSDPerHour: 3.99, Family: fabric.FamilyH200SXM},
-	{GpuTypeID: "NVIDIA B200", VRAMGb: 192, DefaultSystemRAMGb: 256, DefaultDiskGb: 100, PriceUSDPerHour: 5.99, Family: fabric.FamilyB200},
+	// 180, not the 192 of the launch announcement. NVIDIA's shipping spec
+	// is 180 GB (1440 GB per 8-GPU DGX B200), Lambda sells it as 180, and a
+	// Vast host reports 183359 MiB, which is 179 GiB. The 192 is the same
+	// memory counted in decimal gigabytes.
+	{GpuTypeID: "NVIDIA B200", VRAMGb: 180, DefaultSystemRAMGb: 256, DefaultDiskGb: 100, PriceUSDPerHour: 5.99, Family: fabric.FamilyB200},
 }
 
 // Class-to-constraint-defaults lives in the service layer
@@ -157,7 +161,7 @@ func MatchSKUs(reqs *provisionerv1.ResourceRequirements) []string {
 		// rents a pool and bills for it before reporting that the fabric was
 		// never there.
 		if !fabric.Satisfies(
-			fabric.Resolve(fabric.Observation{Family: sku.Family}),
+			fabric.Resolve(fabric.Observation{Family: sku.Family, GpuCount: reqs.GetGpuCount()}),
 			reqs.GetFabricScope(), reqs.GetMinFabricGbps(),
 		) {
 			continue
@@ -249,9 +253,21 @@ func stampFabric(hw *provisionerv1.Hardware, gpuTypeID string) {
 	if spec := LookupSKU(gpuTypeID); spec != nil {
 		family = spec.Family
 	}
-	res := fabric.Resolve(fabric.Observation{Family: family})
+	// The group's width counts: a bridge joins pairs, so four bridged
+	// cards are islands rather than one intra-node fabric.
+	res := fabric.Resolve(fabric.Observation{Family: family, GpuCount: hw.GetGpuCount()})
 	hw.FabricScope = res.Scope
 	hw.FabricSource = res.Source
 	hw.FabricGbps = res.Gbps
 	hw.FabricTechnology = res.Technology
+}
+
+// splitHint names the families an intra-node request refused because their
+// fabric does not join that many cards, as a suffix for a no-match error.
+func splitHint(reqs *provisionerv1.ResourceRequirements) string {
+	families := make([]fabric.Family, len(skus))
+	for i, sku := range skus {
+		families[i] = sku.Family
+	}
+	return fabric.SplitHint(families, reqs.GetFabricScope(), reqs.GetGpuCount())
 }

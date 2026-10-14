@@ -96,8 +96,10 @@ func MatchSKUs(reqs *provisionerv1.ResourceRequirements) []string {
 		}
 		// Fabric filter, declared tier only -- Lambda reports no measurement.
 		// See the runpod resolver for why UNKNOWN candidates are dropped.
+		// The group's width counts too: an intra-node fabric has to join
+		// every card asked for, and a bridge joins only a pair.
 		if !fabric.Satisfies(
-			fabric.Resolve(fabric.Observation{Family: sku.Family}),
+			fabric.Resolve(fabric.Observation{Family: sku.Family, GpuCount: reqs.GetGpuCount()}),
 			reqs.GetFabricScope(), reqs.GetMinFabricGbps(),
 		) {
 			continue
@@ -177,12 +179,26 @@ func isActiveProviderState(status string) bool {
 // curated catalog resolves to UNKNOWN rather than to a guess.
 func stampFabric(hw *provisionerv1.Hardware, instanceTypeName string) {
 	var family fabric.Family
+	gpuCount := hw.GetGpuCount()
 	if spec := LookupSKU(instanceTypeName); spec != nil {
 		family = spec.Family
+		if gpuCount == 0 {
+			gpuCount = int32(spec.GPUCount)
+		}
 	}
-	res := fabric.Resolve(fabric.Observation{Family: family})
+	res := fabric.Resolve(fabric.Observation{Family: family, GpuCount: gpuCount})
 	hw.FabricScope = res.Scope
 	hw.FabricSource = res.Source
 	hw.FabricGbps = res.Gbps
 	hw.FabricTechnology = res.Technology
+}
+
+// splitHint names the families an intra-node request refused because their
+// fabric does not join that many cards, as a suffix for a no-match error.
+func splitHint(reqs *provisionerv1.ResourceRequirements) string {
+	families := make([]fabric.Family, len(skus))
+	for i, sku := range skus {
+		families[i] = sku.Family
+	}
+	return fabric.SplitHint(families, reqs.GetFabricScope(), reqs.GetGpuCount())
 }

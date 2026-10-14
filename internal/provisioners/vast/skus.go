@@ -117,7 +117,10 @@ var skus = []SKUSpec{
 	// XL (>=94 GB VRAM): frontier / multi-tenant.
 	{GpuName: "H100_NVL", DisplayName: "H100 NVL", VRAMGb: 94, DefaultSystemRAMGb: 192, DefaultDiskGb: 100, PriceUSDPerHour: 2.30, Family: fabric.FamilyH100NVL},
 	{GpuName: "H200", DisplayName: "H200", VRAMGb: 141, DefaultSystemRAMGb: 256, DefaultDiskGb: 100, PriceUSDPerHour: 3.20, Family: fabric.FamilyH200SXM},
-	{GpuName: "B200", DisplayName: "B200", VRAMGb: 192, DefaultSystemRAMGb: 256, DefaultDiskGb: 100, PriceUSDPerHour: 4.80, Family: fabric.FamilyB200},
+	// 180, not 192: the card reports 183359 MiB (179 GiB, or 192 decimal
+	// GB), and NVIDIA's shipping spec and Lambda both say 180. Matches the
+	// RunPod and Lambda rows, so one card reads the same on every provider.
+	{GpuName: "B200", DisplayName: "B200", VRAMGb: 180, DefaultSystemRAMGb: 256, DefaultDiskGb: 100, PriceUSDPerHour: 4.80, Family: fabric.FamilyB200},
 }
 
 // MaxSKUsPerRequest caps the SKUs the resolver will try when no
@@ -158,7 +161,7 @@ func MatchSKUs(reqs *provisionerv1.ResourceRequirements) []string {
 		// the requested fabric and leaves bridge-capable ones searchable.
 		// findOffer pushes the bandwidth filter server-side and the reading
 		// on the picked offer is what actually decides.
-		if !fabric.CouldSatisfy(sku.Family, reqs.GetFabricScope()) {
+		if !fabric.CouldSatisfy(sku.Family, reqs.GetFabricScope(), reqs.GetGpuCount()) {
 			continue
 		}
 		matches = append(matches, sku)
@@ -249,7 +252,8 @@ func stampFabric(hw *provisionerv1.Hardware, gpuName string, bwNvlink *float64) 
 	if spec := LookupSKU(gpuName); spec != nil {
 		family = spec.Family
 	}
-	obs := fabric.Observation{Family: family}
+	// The group's width counts: a measured bridge still joins only a pair.
+	obs := fabric.Observation{Family: family, GpuCount: hw.GetGpuCount()}
 	if bwNvlink != nil {
 		obs.HasMeasurement = true
 		obs.MeasuredGbps = fabric.GbpsFromGBps(*bwNvlink)
@@ -259,4 +263,14 @@ func stampFabric(hw *provisionerv1.Hardware, gpuName string, bwNvlink *float64) 
 	hw.FabricSource = res.Source
 	hw.FabricGbps = res.Gbps
 	hw.FabricTechnology = res.Technology
+}
+
+// splitHint names the families an intra-node request refused because their
+// fabric does not join that many cards, as a suffix for a no-match error.
+func splitHint(reqs *provisionerv1.ResourceRequirements) string {
+	families := make([]fabric.Family, len(skus))
+	for i, sku := range skus {
+		families[i] = sku.Family
+	}
+	return fabric.SplitHint(families, reqs.GetFabricScope(), reqs.GetGpuCount())
 }

@@ -183,7 +183,7 @@ func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.In
 		} else if matches := MatchSKUs(reqs); len(matches) > 0 {
 			gpuSKUs = matches
 		} else {
-			return createPodRequest{}, nil, fmt.Errorf("no runpod SKU satisfies the deployment's requirements (min_vram_gb=%d)", reqs.GetMinVramGb())
+			return createPodRequest{}, nil, fmt.Errorf("no runpod SKU satisfies the deployment's requirements (min_vram_gb=%d)%s", reqs.GetMinVramGb(), splitHint(reqs))
 		}
 	}
 
