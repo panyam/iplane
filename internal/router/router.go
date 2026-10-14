@@ -686,7 +686,9 @@ func (r *Router) handleDescribeError(w http.ResponseWriter, deployID string, err
 //   - RUNNING with engine_endpoint -> forward
 //   - RUNNING without engine_endpoint -> 503 (rare race window)
 //   - PENDING / STARTING / CONFIGURING -> 503 + Retry-After
-//   - DEGRADED -> 502 (engine unhealthy)
+//   - DEGRADED with at least one stamped endpoint -> forward; the
+//     replica picker routes over the healthy replicas only
+//   - DEGRADED with no stamped endpoint -> 502 (engine unhealthy)
 //   - TERMINATING / TERMINATED -> 410 Gone
 //   - FAILED -> 502 with failure_reason
 //   - UNSPECIFIED -> 503 (defensive; should never happen)
@@ -712,8 +714,17 @@ func (r *Router) forwardable(w http.ResponseWriter, dep *provisionerv1.Deploymen
 		writeOpenAIError(w, http.StatusServiceUnavailable, fmt.Sprintf("deployment %q is %s; retry shortly", dep.GetId(), stateLabel(dep.GetState())), "deployment_not_ready")
 		return false
 	case provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED:
-		writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("deployment %q engine is unhealthy", dep.GetId()), "engine_unhealthy")
-		return false
+		// DEGRADED means some replicas failed and the rest are serving,
+		// so it forwards like RUNNING: pickReplica already skips the
+		// tombstoned and quarantined slots, and answers 503 if none is
+		// left right now. Refusing every request here turned a 2-of-3
+		// deployment into a 0-of-3 one. Only a DEGRADED record with no
+		// endpoint at all has nothing to fall back on.
+		if !hasStampedEndpoint(dep) {
+			writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("deployment %q engine is unhealthy", dep.GetId()), "engine_unhealthy")
+			return false
+		}
+		return true
 	case provisionerv1.DeploymentState_DEPLOYMENT_STATE_TERMINATING,
 		provisionerv1.DeploymentState_DEPLOYMENT_STATE_TERMINATED:
 		writeOpenAIError(w, http.StatusGone, fmt.Sprintf("deployment %q is %s", dep.GetId(), stateLabel(dep.GetState())), "deployment_gone")

@@ -203,7 +203,77 @@ func TestRouter_TerminatedDeployment_410(t *testing.T) {
 	}
 }
 
-func TestRouter_DegradedDeployment_502(t *testing.T) {
+// DEGRADED means some replicas failed and some are serving. The
+// router keeps routing to the healthy ones: a 2-of-3 deployment
+// serves on two replicas rather than refusing all traffic.
+func TestRouter_DegradedDeployment_ServesOnHealthyReplicas(t *testing.T) {
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"from-healthy-replica"}`)
+	}))
+	defer engine.Close()
+
+	r := newTestRouter(func(_ *provisionerv1.DescribeDeploymentRequest) (*provisionerv1.DescribeDeploymentResponse, error) {
+		return &provisionerv1.DescribeDeploymentResponse{Deployment: &provisionerv1.Deployment{
+			Id:            "x",
+			State:         provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED,
+			FailureReason: "replica 1 failed to start",
+			Replicas: []*provisionerv1.ReplicaBacking{
+				{InstanceIds: []string{"a"}, EngineEndpoint: engine.URL},
+				{InstanceIds: []string{"b"}}, // tombstone: never came up
+			},
+		}}, nil
+	})
+	srv := httptest.NewServer(serveThroughMux(r))
+	defer srv.Close()
+
+	for i := range 4 {
+		resp, err := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200; body=%s", i, resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), "from-healthy-replica") {
+			t.Errorf("request %d: body should come from the healthy replica; got %s", i, body)
+		}
+	}
+}
+
+// A DEGRADED deployment whose surviving replicas are all quarantined
+// has nothing to route to right now: same 503 + Retry-After as a
+// RUNNING deployment in that position.
+func TestRouter_DegradedDeployment_AllQuarantined_503(t *testing.T) {
+	r := newTestRouter(func(_ *provisionerv1.DescribeDeploymentRequest) (*provisionerv1.DescribeDeploymentResponse, error) {
+		return &provisionerv1.DescribeDeploymentResponse{Deployment: &provisionerv1.Deployment{
+			Id:    "x",
+			State: provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED,
+			Replicas: []*provisionerv1.ReplicaBacking{
+				{InstanceIds: []string{"a"}, EngineEndpoint: "http://127.0.0.1:1"},
+				{InstanceIds: []string{"b"}},
+			},
+			UnhealthyInstanceIds: []string{"a"},
+		}}, nil
+	})
+	srv := httptest.NewServer(serveThroughMux(r))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/x/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+	assertOpenAIErrorBody(t, resp, "replica_unavailable")
+}
+
+// A DEGRADED deployment with no engine endpoint at all has no
+// healthy replica to fall back on, so it still answers 502.
+func TestRouter_DegradedDeployment_NoEndpoints_502(t *testing.T) {
 	r := newTestRouter(func(_ *provisionerv1.DescribeDeploymentRequest) (*provisionerv1.DescribeDeploymentResponse, error) {
 		return &provisionerv1.DescribeDeploymentResponse{Deployment: &provisionerv1.Deployment{
 			Id:    "x",

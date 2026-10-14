@@ -217,6 +217,45 @@ func TestRouter_Flat_AllMatchesNotRunning_503ish(t *testing.T) {
 	}
 }
 
+// A DEGRADED deployment is still serving, so the flat URL ranks it
+// ahead of one that is not serving yet, even a newer one.
+func TestRouter_Flat_PrefersDegradedOverNotYetServing(t *testing.T) {
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"degraded-but-serving"}`)
+	}))
+	defer engine.Close()
+	r := newFlatTestRouter(func(_ *provisionerv1.ListDeploymentsRequest) (*provisionerv1.ListDeploymentsResponse, error) {
+		return &provisionerv1.ListDeploymentsResponse{Deployments: []*provisionerv1.Deployment{
+			{
+				Id: "half-up", Model: "test/model",
+				State:     provisionerv1.DeploymentState_DEPLOYMENT_STATE_DEGRADED,
+				CreatedAt: timestamppb.New(time.Now().Add(-time.Hour)),
+				Replicas: []*provisionerv1.ReplicaBacking{
+					{InstanceIds: []string{"a"}, EngineEndpoint: engine.URL},
+					{InstanceIds: []string{"b"}},
+				},
+			},
+			{
+				Id: "warming-up", Model: "test/model",
+				State:     provisionerv1.DeploymentState_DEPLOYMENT_STATE_STARTING,
+				CreatedAt: timestamppb.New(time.Now()),
+			},
+		}}, nil
+	})
+	srv := httptest.NewServer(serveThroughMux(r))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"test/model","messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "degraded-but-serving") {
+		t.Errorf("status = %d body = %s; want 200 from the DEGRADED deployment", resp.StatusCode, body)
+	}
+}
+
 func TestRouter_Flat_CompletionsRouteAlsoForwards(t *testing.T) {
 	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/completions" {
