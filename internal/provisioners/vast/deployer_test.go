@@ -257,6 +257,11 @@ func TestWaitForEngineReadyTimesOutWithAReason(t *testing.T) {
 	if !strings.Contains(err.Error(), "public address") && !strings.Contains(err.Error(), "did not answer") {
 		t.Errorf("error = %v, want it to say what it was waiting for", err)
 	}
+	// The deadline is the daemon's, so the message has to name the setting
+	// that moves it rather than leave the operator raising --timeout.
+	if !strings.Contains(err.Error(), "IPLANE_ENGINE_READY_TIMEOUT") {
+		t.Errorf("error = %v, want it to name IPLANE_ENGINE_READY_TIMEOUT", err)
+	}
 }
 
 func TestDestroyWithNoContractIsNotAnError(t *testing.T) {
