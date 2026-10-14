@@ -324,7 +324,7 @@ func buildIplane() (string, error) {
 		return "", err
 	}
 	bin := filepath.Join(dir, "iplane")
-	cmd := exec.Command("go", "build", "-o", bin, "../../../cmd/iplane")
+	cmd := exec.Command("go", "build", "-o", bin, "../../cmd/iplane")
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
