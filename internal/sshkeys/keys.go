@@ -91,8 +91,8 @@ func IsIplaneComment(comment string) bool {
 
 // MarshalAuthorizedKey returns the public half in OpenSSH
 // authorized_keys format: "ssh-ed25519 BASE64 <comment>\n". Suitable
-// to concatenate into a server-side authorized_keys file or into
-// RunPod's user-level pubKey blob.
+// to concatenate into a server-side authorized_keys file or to add to
+// RunPod's account SSH keys (one entry per key).
 func (k *KeyPair) MarshalAuthorizedKey() ([]byte, error) {
 	sshPub, err := ssh.NewPublicKey(k.Public)
 	if err != nil {

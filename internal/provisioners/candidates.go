@@ -52,9 +52,10 @@ import (
 //     gpuCount and returns both a live price and a stock level, and 35 of 48
 //     types were obtainable as a single GPU against 11 of 48 as eight.
 //     Availability is a property of a card AT a width, which is exactly what a
-//     catalog cannot express. Note the REST API has no catalog endpoint at
-//     all, so this is the one GraphQL read in the adapter besides SSH keys.
-//     Neither a host nor a region: RunPod schedules where it likes.
+//     catalog cannot express. The read is REST v2's GET /catalog/gpus at
+//     the requested count (GraphQL's gpuTypes until 2026-10, when REST v1
+//     had no catalog at all). Neither a host nor a region: RunPod
+//     schedules where it likes.
 //
 //   - local, external: no, and structurally so. Neither selects among
 //     candidates. local is the one machine the operator already has, and

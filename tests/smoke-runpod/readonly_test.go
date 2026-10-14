@@ -1,7 +1,7 @@
 //go:build runpod_readonly
 
 // Read-only checks of the RunPod adapter against the live REST v2 API.
-// Every call is a GET: the pod list, the GPU and datacenter catalogs, the
+// Every call is a GET: the pod list, the GPU catalog, the
 // account's SSH keys, and the network volumes. Nothing is created,
 // started, stopped or modified, so this costs nothing.
 //
@@ -61,8 +61,7 @@ func TestRunPodReadOnly_Pods(t *testing.T) {
 	smokeproviders.RunList(t, readOnlyProvider(t))
 }
 
-// GET /v2/catalog/gpus at one and eight cards, both clouds, plus
-// GET /v2/catalog/datacenters.
+// GET /v2/catalog/gpus at one and eight cards, both clouds.
 func TestRunPodReadOnly_Catalog(t *testing.T) {
 	p := readOnlyProvider(t)
 	for _, n := range []int32{1, 8} {
@@ -78,9 +77,9 @@ func TestRunPodReadOnly_Catalog(t *testing.T) {
 				t.Logf("  ... %d more", len(got)-8)
 				break
 			}
-			t.Logf("  %-24s %-10s $%7.2f/h  stock=%-6s cloud=%-9s storage=%s",
-				c.GetSku(), c.GetRegion(), c.GetPriceUsdPerHour(),
-				c.GetAttrs()["stock_status"], c.GetAttrs()["cloud"], c.GetAttrs()["datacenter_storage"])
+			t.Logf("  %-24s $%7.2f/h  stock=%-6s cloud=%s",
+				c.GetSku(), c.GetPriceUsdPerHour(),
+				c.GetAttrs()["stock_status"], c.GetAttrs()["cloud"])
 			if c.GetPriceUsdPerHour() <= 0 || c.GetVramGbPerGpu() < 80 {
 				t.Errorf("implausible candidate %+v: a decode is reading a field RunPod does not send", c)
 			}

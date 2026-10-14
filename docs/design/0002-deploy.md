@@ -272,6 +272,8 @@ The Service calls this at instance-create time, before Spawn. If the provider do
 
 **iplane package shape**: `internal/sshkeys/` (small, ~200 LOC): key-gen, marshal helpers, the oneauth wrapper. The RunPod GraphQL client lives in the runpod adapter (`internal/provisioners/runpod/keyregistrar.go`).
 
+> **Superseded transport, 2026-10.** RunPod retires GraphQL in early 2027 and REST v1 on 2026-11-15. The adapter now speaks REST v2 only, and SSH keys moved to `GET`/`PUT https://api.runpod.io/v2/account/ssh-keys`, a JSON list of authorized_keys lines with the same whole-set replace semantics, so the read-modify-write above is unchanged. The scope is `authentication:read`/`authentication:write` rather than "Full access only", and keys reach a pod only when the create sets `startSsh`. The GraphQL client is deleted. See `internal/provisioners/runpod/NOTES.md`.
+
 ### Failure-mode contract
 
 Mirrors Phase 1's three-step pattern:

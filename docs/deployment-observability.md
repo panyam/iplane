@@ -25,15 +25,16 @@ adapter emits — no telemetry wiring.
 ## Phases
 
 The deployer reads two observable signals during the `/health` wait and
-maps them to a monotonic phase ladder. They come from different API
-versions because neither carries both: v1 has the host assignment but no
-container-runtime state, v2 has the runtime block.
+maps them to a monotonic phase ladder. On RunPod both come from one
+`GET /v2/pods/{id}`. Until 2026-10 they took two reads, because REST v1
+had the host assignment (`machineId`) but no container-runtime state and
+only v2 had the `runtime` block.
 
 | Phase                | Signal                                              | What's happening                          |
 | -------------------- | --------------------------------------------------- | ----------------------------------------- |
-| `runpod:scheduling`  | v1 `machineId` empty and `machine` empty             | RunPod finding capacity for the SKU set   |
-| `runpod:image-pull`  | v1 host assigned, v2 `runtime` null                  | host assigned, pulling the engine image   |
-| `engine:init`        | v2 `runtime` populated                               | container up, model download + weight load |
+| `runpod:scheduling`  | no `dataCenterId`, `cudaVersion` or SSH proxy yet    | RunPod placing the pod on a host          |
+| `runpod:image-pull`  | host fields set, `runtime` null or empty             | host assigned, pulling the engine image   |
+| `engine:init`        | `runtime` populated                                  | container up, model download + weight load |
 | `engine:serving`     | `/health` 2xx                                        | engine answering; deploy is RUNNING        |
 
 Both signals are **state**, never timestamps. v1's `lastStartedAt` looks
