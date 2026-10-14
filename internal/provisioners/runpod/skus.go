@@ -13,16 +13,13 @@ import (
 // the system RAM that comes with one GPU on RunPod's default pod
 // shape, and a rough price tier (USD/hr at the cheapest cloud type).
 //
-// Verify against the live API with:
+// Verify against the live catalog (read-only) with:
 //
-//	curl -X GET https://rest.runpod.io/v1/gpus -H "Authorization: Bearer $RUNPOD_API_KEY"
+//	curl -s https://api.runpod.io/v2/catalog/gpus -H "Authorization: Bearer $RUNPOD_API_KEY"
 //
-// Or the GraphQL fallback:
-//
-//	curl -X POST https://api.runpod.io/graphql \
-//	  -H "Authorization: Bearer $RUNPOD_API_KEY" \
-//	  -H "Content-Type: application/json" \
-//	  -d '{"query": "query { gpuTypes { id displayName memoryInGb securePrice communityPrice } }"}'
+// which returns {"gpus": [{id, name, memory, price: {secure, community}, ...}]};
+// memory is VRAM in GB and price is per card. `make runpod-v2-check` runs
+// that and the other read-only checks.
 //
 // These are pre-Spawn estimates; the actual price (and the actual VRAM
 // allocation) is reported by the provider in the Spawn response and
@@ -45,31 +42,30 @@ type SKUSpec struct {
 	Family fabric.Family
 }
 
-// skus is the catalog the resolver iterates. Order in the slice is the
-// fallback order RunPod tries when we pass gpuTypeIds as an array --
-// availability-first if we leave gpuTypePriority on its default. The
-// resolver re-sorts the matching subset by price before emitting the
-// final list.
+// skus is the catalog the resolver iterates. The resolver sorts the
+// matching subset by price, and createPod tries the result in that order,
+// one POST /pods per SKU, until RunPod places one.
 //
-// Each GpuTypeID must be an exact enum value in RunPod's REST schema
-// (the validator on POST /pods rejects anything outside its enum).
-// Confirm current values against:
+// Each GpuTypeID must be an id GET /v2/catalog/gpus lists (the `id`
+// field, which is what gpu.id on a create takes). Confirm current values
+// against:
 //
-//	curl -X GET https://rest.runpod.io/v1/gpus -H "Authorization: Bearer $RUNPOD_API_KEY"
+//	curl -s https://api.runpod.io/v2/catalog/gpus -H "Authorization: Bearer $RUNPOD_API_KEY"
 //
 // RunPod periodically retires SKUs (e.g., the A100 40GB PCIe was
-// dropped from the enum sometime before 2026-05) and adds new ones
-// (B200, H200 variants, Blackwell PRO 6000 line). A wrong entry here
-// surfaces as a 400 schema validation rejection with the full enum
-// list in the problems field, which is enough to update the catalog.
+// dropped sometime before 2026-05) and adds new ones (B200, H200
+// variants, Blackwell PRO 6000 line). A retired entry here costs one
+// refused create per Spawn and is skipped; the catalog listing is how to
+// spot it.
 var skus = []SKUSpec{
 	// Small (>=24 GB VRAM): consumer + entry datacenter.
 	{GpuTypeID: "NVIDIA GeForce RTX 4090", VRAMGb: 24, DefaultSystemRAMGb: 16, DefaultDiskGb: 20, PriceUSDPerHour: 0.39, Family: fabric.FamilyRTX4090},
 	{GpuTypeID: "NVIDIA RTX A5000", VRAMGb: 24, DefaultSystemRAMGb: 24, DefaultDiskGb: 20, PriceUSDPerHour: 0.36, Family: fabric.FamilyA5000},
 	{GpuTypeID: "NVIDIA L4", VRAMGb: 24, DefaultSystemRAMGb: 24, DefaultDiskGb: 20, PriceUSDPerHour: 0.43, Family: fabric.FamilyL4},
-	// "NVIDIA A30" was retired from RunPod's REST enum (confirmed 2026-07-27:
-	// a create with it in gpuTypeIds 400s with the full enum, A30 absent).
-	// Any min_vram_gb<=24 request included it in the top-5 and failed whole.
+	// "NVIDIA A30" was retired from RunPod's v1 REST enum (confirmed
+	// 2026-07-27: a create with it in gpuTypeIds 400s with the full enum,
+	// A30 absent). Under v1 any min_vram_gb<=24 request included it in the
+	// top-5 and failed whole.
 	{GpuTypeID: "NVIDIA GeForce RTX 5090", VRAMGb: 32, DefaultSystemRAMGb: 24, DefaultDiskGb: 20, PriceUSDPerHour: 0.69, Family: fabric.FamilyRTX5090},
 
 	// Medium (>=40 GB VRAM): workstation / mid-datacenter.
@@ -97,8 +93,8 @@ var skus = []SKUSpec{
 // numeric requirements on RunPod, Lambda, AWS, anywhere. The runpod
 // adapter only sees expanded constraints.
 
-// MaxSKUsPerRequest caps the number of gpuTypeIds we send to RunPod on
-// a single create. Two reasons to cap:
+// MaxSKUsPerRequest caps how many GPU types one Spawn or Deploy tries.
+// Three reasons to cap:
 //
 //   - Class shorthand has no upper bound today (class=small expands to
 //     min_vram_gb=24 with no max). Without a cap, every SKU with
@@ -107,11 +103,15 @@ var skus = []SKUSpec{
 //     frontier GPU because the cheap tier is exhausted; the price would
 //     be 10x higher than expected.
 //
+//   - v2's create places one GPU type and never falls back, so the adapter
+//     walks the list itself, one create per entry (twice per entry for a
+//     deploy that may also try COMMUNITY). The tail of the list is real
+//     fallback, and each step of it is a round trip.
+//
 //   - Some RunPod accounts are restricted from provisioning specific
-//     SKUs (B200, H200, H100 NVL typically require approval). Including
-//     restricted SKUs in gpuTypeIds can trigger account-level 401s
-//     across the whole request rather than RunPod just skipping the
-//     restricted entries.
+//     SKUs (B200, H200, H100 NVL typically require approval). v2 answers
+//     a restricted SKU with 403 and the walk skips it; under v1 one
+//     restricted entry in gpuTypeIds could fail the whole request.
 //
 // Capping at top-5 cheapest preserves real fallback (RunPod will try
 // each in order if the cheapest is unavailable) without exposing the
@@ -126,9 +126,8 @@ const MaxSKUsPerRequest = 5
 // it returns the ordered list of gpuTypeIds that satisfy every
 // numeric constraint, cheapest first, capped at MaxSKUsPerRequest.
 //
-// The returned slice is the gpuTypeIds value the Spawn call passes
-// to RunPod's POST /pods -- RunPod tries them in order (with
-// gpuTypePriority=availability or custom controlling the policy).
+// The returned slice is the order Spawn and Deploy try GPU types in, one
+// POST /pods per entry.
 //
 // Returns an empty slice if no SKU in the catalog satisfies the
 // constraints; the caller should surface this as "no matching SKU"
@@ -223,13 +222,19 @@ func knownClasses() []string {
 	}
 }
 
-// isActiveProviderState reports whether a RunPod desiredStatus counts
-// as "the instance is up and idempotency-adoptable." See the
+// isActiveProviderState reports whether a RunPod pod status counts as
+// "the instance is up and idempotency-adoptable." See the
 // ActiveStateChecker discussion in internal/provisioners/service.go
 // for why this lives in the adapter package rather than centrally.
+//
+// v2's statuses are PROVISIONING, STARTING, RUNNING, EXITED, ERROR and
+// TERMINATED. The first three are a rental in progress or in service, the
+// counterpart of v1's CREATED / RUNNING / RESTARTING desiredStatus. EXITED
+// is a stopped pod that bills nothing for compute, and ERROR is RunPod's
+// "unrecoverable"; neither is something to adopt.
 func isActiveProviderState(state string) bool {
 	switch strings.ToUpper(state) {
-	case "CREATED", "RUNNING", "RESTARTING":
+	case "PROVISIONING", "STARTING", "RUNNING":
 		return true
 	}
 	return false

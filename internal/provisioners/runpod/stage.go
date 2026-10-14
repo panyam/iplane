@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,9 +31,12 @@ const (
 	// rather than baked, so no custom image is needed.
 	defaultStageImage = "python:3.11-slim"
 
-	// stageComputeType asks RunPod for a CPU-only pod -- staging is a
-	// pure download, so paying for a GPU would be waste.
-	stageComputeType = "CPU"
+	// stageVCPUs is the vCPU count of the CPU-only staging pod -- staging
+	// is a pure download, so paying for a GPU would be waste. v2 sizes a
+	// CPU pod as a flavor plus a power-of-two vCPU count, and RAM follows
+	// from the flavor's ramGbPerVcpu, so four vCPUs is also what buys the
+	// download some memory (see the --max-workers note below).
+	stageVCPUs = 4
 
 	stagePollInterval = 10 * time.Second
 	stageTimeout      = 30 * time.Minute
@@ -77,7 +83,8 @@ func (p *Provider) StageModel(ctx context.Context, spec provisioners.StageSpec) 
 	// huggingface_hub removed the huggingface-cli entrypoint (it prints a
 	// deprecation notice and exits non-zero), and the CLI is now `hf`.
 	//
-	// --max-workers 2: the CPU staging pod has little RAM (~4 GB), and the
+	// --max-workers 2: the CPU staging pod has little RAM (~4 GB on the v1
+	// default it was measured on; stageVCPUs buys more on v2), and the
 	// default 8 parallel workers streaming multi-GB shards through the FUSE
 	// volume mount OOM-kill the download (SIGKILL / rc 137) on a large
 	// model. Throttling concurrency keeps it under the RAM ceiling. A small
@@ -90,23 +97,31 @@ func (p *Provider) StageModel(ctx context.Context, spec provisioners.StageSpec) 
 		),
 	}
 
+	flavors, err := p.stageCPUFlavors(ctx, spec.Region)
+	if err != nil {
+		return err
+	}
+	tries := make([]podPlacement, 0, len(flavors))
+	for _, f := range flavors {
+		tries = append(tries, podPlacement{cpuID: f})
+	}
+
+	var dataCenterIDs []string
+	if spec.Region != "" {
+		dataCenterIDs = []string{spec.Region}
+	}
 	createBody := createPodRequest{
-		Name:            "iplane-stage-" + volumeShortID(spec.VolumeID),
-		ImageName:       defaultStageImage,
-		ComputeType:     stageComputeType,
-		NetworkVolumeID: spec.VolumeID,
-		VolumeMountPath: mountPath,
-		DataCenterIDs:   []string{spec.Region},
-		Env:             env,
-		DockerStartCmd:  cmd,
+		Name:          "iplane-stage-" + volumeShortID(spec.VolumeID),
+		Image:         defaultStageImage,
+		CPU:           &createCPU{VCPUCount: stageVCPUs},
+		Mounts:        &podMounts{Network: []networkMount{{VolumeID: spec.VolumeID, Path: mountPath}}},
+		DataCenterIDs: dataCenterIDs,
+		Env:           env,
+		Cmd:           cmd,
 	}
-	req, err := p.client.newReq("POST", "/pods", nil, createBody)
+	created, _, err := p.createPod(ctx, "stage model", createBody, tries)
 	if err != nil {
-		return wrapErr("stage model", err)
-	}
-	created, err := skhttp.Call[createPodResponse](ctx, req, p.client.callOpts()...)
-	if err != nil {
-		return wrapErr("stage model", err)
+		return err
 	}
 
 	// Always tear the staging pod down, success or failure -- it is a
@@ -121,11 +136,11 @@ func (p *Provider) StageModel(ctx context.Context, spec provisioners.StageSpec) 
 
 // waitForStageComplete polls the staging pod's logs until the download
 // command prints its completion marker. RunPod exposes no pod-status
-// signal that a one-shot command finished -- v1 keeps desiredStatus at
-// RUNNING, and even v2's status stays RUNNING because the exited
-// container is restarted (confirmed live 2026-07-28). So the command
+// signal that a one-shot command finished -- the pod's status stays
+// RUNNING because the exited container is restarted (confirmed live
+// 2026-07-28, on both v1's desiredStatus and v2's status). So the command
 // echoes stageSentinelDone / stageSentinelFail and we read it back out
-// of the v2 pod-logs stream.
+// of the pod-logs stream.
 func (p *Provider) waitForStageComplete(ctx context.Context, podID string) error {
 	interval := p.stageInterval
 	if interval <= 0 {
@@ -159,15 +174,15 @@ func (p *Provider) waitForStageComplete(ctx context.Context, podID string) error
 	}
 }
 
-// fetchStageLogs reads a bounded chunk of the staging pod's v2 log
-// stream. The endpoint is Server-Sent Events: the tail backfill arrives
+// fetchStageLogs reads a bounded chunk of the staging pod's log
+// stream (GET /pods/{id}/logs). The endpoint is Server-Sent Events: the tail backfill arrives
 // immediately and the stream then stays open, so we read under a short
 // deadline and cut it off, scanning whatever arrived. A deadline while
 // reading the still-open stream is expected, not an error.
 func (p *Provider) fetchStageLogs(ctx context.Context, podID string) ([]byte, error) {
 	readCtx, cancel := context.WithTimeout(ctx, logsReadTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(readCtx, http.MethodGet, p.client.v2LogsURL(podID), nil)
+	req, err := http.NewRequestWithContext(readCtx, http.MethodGet, p.client.podLogsURL(podID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +223,102 @@ func stageSignal(logs []byte) (done, failed bool) {
 		return true, false
 	}
 	return false, false
+}
+
+// cpuCatalogResponse is GET /catalog/cpus with include=AVAILABILITY.
+type cpuCatalogResponse struct {
+	CPUs []cpuFlavor `json:"cpus"`
+}
+
+// cpuFlavor is the subset of CpuType the staging pod needs: which flavor,
+// what vCPU counts it accepts, what it costs, and where it can be had.
+type cpuFlavor struct {
+	ID   string `json:"id"`
+	VCPU struct {
+		Min int `json:"min"`
+		Max int `json:"max"`
+	} `json:"vcpu"`
+	Price struct {
+		SecurePerVcpu float64 `json:"securePerVcpu"`
+	} `json:"price"`
+	Availability string              `json:"availability"`
+	DataCenters  []catalogDatacenter `json:"dataCenters"`
+}
+
+// catalogDatacenter is DataCenterAvailability as the CPU catalog reports
+// it per datacenter.
+type catalogDatacenter struct {
+	ID           string `json:"id"`
+	Availability string `json:"availability"`
+}
+
+// inStock reports whether a catalog availability level means "can be had".
+// NONE and an absent field both mean no.
+func inStock(level string) bool {
+	switch strings.ToUpper(level) {
+	case "LOW", "MEDIUM", "HIGH":
+		return true
+	}
+	return false
+}
+
+// stageCPUFlavors picks the CPU flavors a staging pod can try in region,
+// cheapest first.
+//
+// v1 took computeType=CPU and chose a flavor itself. v2 wants a flavor id
+// from its own catalog, and the ids are RunPod's to change, so the
+// adapter reads them rather than hardcoding one: GET /catalog/cpus at the
+// staging pod's vCPU count, kept to flavors that accept that count and
+// report stock in the volume's datacenter (or anywhere, with no region).
+// createPod then walks them the same way Spawn walks GPU types.
+func (p *Provider) stageCPUFlavors(ctx context.Context, region string) ([]string, error) {
+	q := url.Values{}
+	q.Set("include", "AVAILABILITY")
+	q.Set("product", "POD")
+	q.Set("vcpuCount", strconv.Itoa(stageVCPUs))
+	req, err := p.client.newReq("GET", "/catalog/cpus", q, nil)
+	if err != nil {
+		return nil, wrapErr("stage model", err)
+	}
+	cat, err := skhttp.Call[cpuCatalogResponse](ctx, req, p.client.callOpts()...)
+	if err != nil {
+		return nil, wrapErr("stage model", err)
+	}
+
+	var usable []cpuFlavor
+	for _, f := range cat.CPUs {
+		if f.ID == "" || stageVCPUs < f.VCPU.Min || (f.VCPU.Max > 0 && stageVCPUs > f.VCPU.Max) {
+			continue
+		}
+		if region == "" {
+			if inStock(f.Availability) {
+				usable = append(usable, f)
+			}
+			continue
+		}
+		for _, dc := range f.DataCenters {
+			if dc.ID == region && inStock(dc.Availability) {
+				usable = append(usable, f)
+				break
+			}
+		}
+	}
+	if len(usable) == 0 {
+		where := "any datacenter"
+		if region != "" {
+			where = region
+		}
+		return nil, provisioners.NewProviderError(p.Name(), "stage model",
+			fmt.Errorf("no CPU flavor with %d vCPUs is available in %s for the staging pod", stageVCPUs, where), 0)
+	}
+	sort.SliceStable(usable, func(i, j int) bool {
+		return usable[i].Price.SecurePerVcpu < usable[j].Price.SecurePerVcpu
+	})
+	ids := make([]string, 0, len(usable))
+	for _, f := range usable {
+		ids = append(ids, f.ID)
+	}
+	return ids, nil
 }
 
 // volumeShortID derives a pod-name-safe suffix from a volume id.

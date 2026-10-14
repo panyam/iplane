@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	skhttp "github.com/panyam/servicekit/http"
-
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
 	"github.com/inference-book/inference-plane/internal/engineagent"
 	"github.com/inference-book/inference-plane/internal/provisioners"
@@ -56,22 +54,14 @@ func (p *Provider) Deploy(ctx context.Context, dep *provisionerv1.Deployment, in
 		ProgressMessage: fmt.Sprintf("spawning pod with image %s", dep.GetImage()),
 	})
 
-	podReq, err := buildEnginePodRequest(dep, inst)
+	podReq, tries, err := buildEnginePodRequest(dep, inst)
 	if err != nil {
 		return failedf(emit, "runpod:create-pod", err)
 	}
 
-	req, err := p.client.newReq("POST", "/pods", nil, podReq)
+	created, _, err := p.createPod(ctx, "deploy", podReq, tries)
 	if err != nil {
-		return failedf(emit, "runpod:create-pod", fmt.Errorf("build request: %w", err))
-	}
-	created, err := skhttp.Call[createPodResponse](ctx, req, p.client.callOpts()...)
-	if err != nil {
-		return failedf(emit, "runpod:create-pod", wrapErr("deploy", err))
-	}
-	if created.ID == "" {
-		return failedf(emit, "runpod:create-pod",
-			fmt.Errorf("runpod returned empty pod id (likely no capacity for any of skus %v)", podReq.GPUTypeIDs))
+		return failedf(emit, "runpod:create-pod", err)
 	}
 
 	emit(provisioners.DeployStateUpdate{
@@ -100,7 +90,7 @@ func (p *Provider) Deploy(ctx context.Context, dep *provisionerv1.Deployment, in
 	return nil
 }
 
-// Destroy terminates the engine pod via DELETE /pods/{id}.
+// Destroy terminates the engine pod via DELETE /v2/pods/{id}.
 // Idempotent: 404 from RunPod is treated as success (already gone).
 //
 // Pod ID lookup order:
@@ -164,36 +154,36 @@ func (p *Provider) Destroy(ctx context.Context, dep *provisionerv1.Deployment, i
 }
 
 // buildEnginePodRequest assembles the createPodRequest for the engine
-// pod. The instance's GPU SKU is inherited (the operator already
-// picked the class when provisioning the instance record); the
-// engine image + model + env come from the Deployment.
-func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.Instance) (createPodRequest, error) {
-	// SKU resolution. RunPod's `gpuTypeIds` accepts a SET of acceptable
-	// SKUs and lets the platform pick one with capacity, so we hand it
-	// the full cheapest-first match list (with `gpuTypePriority=AVAILABILITY`
-	// as a tie-breaker hint). Three cases:
+// pod, plus the placements createPod should try it at. The instance's GPU
+// SKU is inherited (the operator already picked the class when
+// provisioning the instance record); the engine image + model + env come
+// from the Deployment.
+func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.Instance) (createPodRequest, []podPlacement, error) {
+	// SKU resolution. v2 places one GPU type per create, so the
+	// cheapest-first match list becomes the order createPod walks rather
+	// than a set RunPod picks from. Three cases:
 	//   - explicit instance with a resolved SKU: pin to it (the
 	//     operator picked this exact GPU at instance-create time).
 	//   - auto-provisioned instance with reqs.Sku set: also pin
 	//     (operator forced an exact SKU via --sku).
-	//   - auto-provisioned instance with class / min-vram: pass the
-	//     whole MatchSKUs list so RunPod can route to any SKU with
-	//     free capacity, not just the cheapest. Mitigates the common
-	//     "no capacity on A5000 right now" 500.
+	//   - auto-provisioned instance with class / min-vram: try the
+	//     whole MatchSKUs list so a deploy lands on any SKU with free
+	//     capacity, not just the cheapest. Mitigates the common
+	//     "no capacity on A5000 right now" refusal.
 	var gpuSKUs []string
 	if sku := inst.GetHardware().GetGpuSku(); sku != "" {
 		gpuSKUs = []string{sku}
 	} else {
 		reqs := inst.GetSpec().GetRequirements()
 		if reqs == nil {
-			return createPodRequest{}, fmt.Errorf("instance has neither a resolved GPU SKU nor resource requirements to resolve one")
+			return createPodRequest{}, nil, fmt.Errorf("instance has neither a resolved GPU SKU nor resource requirements to resolve one")
 		}
 		if sku := reqs.GetSku(); sku != "" {
 			gpuSKUs = []string{sku}
 		} else if matches := MatchSKUs(reqs); len(matches) > 0 {
 			gpuSKUs = matches
 		} else {
-			return createPodRequest{}, fmt.Errorf("no runpod SKU satisfies the deployment's requirements (min_vram_gb=%d)", reqs.GetMinVramGb())
+			return createPodRequest{}, nil, fmt.Errorf("no runpod SKU satisfies the deployment's requirements (min_vram_gb=%d)", reqs.GetMinVramGb())
 		}
 	}
 
@@ -213,9 +203,8 @@ func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.In
 	// Build the docker CMD. vLLM (and most OpenAI-compat engines) take
 	// `--model X --host 0.0.0.0 --port N` plus the operator's custom
 	// args. The image ENTRYPOINT is the engine binary; we REPLACE the
-	// image CMD with this argv via RunPod's dockerStartCmd field. The
-	// legacy single-string `dockerArgs` was removed from RunPod's REST
-	// schema; argv tokens go on the wire as a JSON array.
+	// image CMD with this argv via v2's `cmd` (exec form, a JSON array,
+	// not a shell-split string).
 	cmd := []string{
 		"--model", dep.GetModel(),
 		"--host", "0.0.0.0",
@@ -242,17 +231,20 @@ func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.In
 
 	// Warm-cache mount: attach a pre-staged network volume by id so the
 	// engine loads weights off it instead of re-downloading from HF.
-	// RunPod's image-native path maps a mount onto networkVolumeId; a
-	// volume is datacenter-locked, so passing the id also pins the pod
-	// to the volume's datacenter (no separate dataCenterIds needed). The
+	// RunPod's image-native path maps a mount onto mounts.network; a
+	// volume is datacenter-locked, so attaching it also pins the pod to
+	// the volume's datacenter (no separate dataCenterIds needed). The
 	// bind-mount (host_path) fields of a VolumeMount belong to the
 	// sshdocker path and are ignored here. Only the first mount is
-	// honored -- RunPod pods attach a single network volume.
-	var networkVolumeID, volumeMountPath string
+	// honored -- v2 caps network mounts at one per pod.
+	var mounts *podMounts
 	for _, m := range dep.GetMounts() {
 		if m.GetVolumeId() != "" {
-			networkVolumeID = m.GetVolumeId()
-			volumeMountPath = m.GetMountPath()
+			path := m.GetMountPath()
+			if path == "" {
+				path = defaultVolumeMountPath
+			}
+			mounts = &podMounts{Network: []networkMount{{VolumeID: m.GetVolumeId(), Path: path}}}
 			break
 		}
 	}
@@ -268,39 +260,41 @@ func buildEnginePodRequest(dep *provisionerv1.Deployment, inst *provisionerv1.In
 		containerDisk = int(reqs.GetMinDiskGb())
 	}
 
-	return createPodRequest{
-		Name:              "iplane-engine-" + dep.GetId(),
-		ImageName:         dep.GetImage(),
-		GPUTypeIDs:        gpuSKUs,
-		GPUTypePriority:   "availability",
-		GPUCount:          gpuCount,
-		ContainerDiskInGB: containerDisk,
-		VolumeInGB:        defaultVolumeGB,
-		NetworkVolumeID:   networkVolumeID,
-		VolumeMountPath:   volumeMountPath,
-		ComputeType:       defaultComputeType,
+	// A debug shell needs a reachable sshd, which keeps the pod on the
+	// SECURE cloud (see the cloud comment in runpod.go); the proxy-only
+	// default can take either.
+	clouds := anyCloud
+	if dep.GetDebugShell() {
+		clouds = sshClouds
+	}
+
+	req := createPodRequest{
+		Name:   "iplane-engine-" + dep.GetId(),
+		Image:  dep.GetImage(),
+		GPU:    &createGPU{Count: gpuCount},
+		Disk:   containerDisk,
+		Mounts: mounts,
 		// RunPod port suffixes:
 		//   /http -> reverse-proxied at
 		//            https://<pod-id>-<port>.proxy.runpod.net.
-		//            No publicIp needed; absent from portMappings.
-		//            Free; works on community capacity.
-		//   /tcp  -> NAT-mapped onto pod.publicIp; appears in
-		//            pod.portMappings[<internal>] = <external>.
-		//            Needs supportPublicIp; bills extra; restricts
-		//            placement to publicIp-capable hosts.
+		//            No public IP needed. Free; works on community
+		//            capacity.
+		//   /tcp  -> NAT-mapped onto a public IP and port, published as
+		//            ssh.direct for 22. Needs a host with a public IP.
 		// Cost-aware default: engine port is /http (proxy URL). SSH is
 		// /tcp but only added when the operator opts in via debug_shell
-		// -- otherwise we'd allocate a publicIp the workload doesn't
-		// need and lose the cheapest community capacity in the catalog.
-		Ports:            enginePodPorts(enginePort, dep.GetDebugShell()),
-		SupportPublicIP:  dep.GetDebugShell(),
-		Env:              env,
-		DockerStartCmd:   cmd,
-		DockerEntrypoint: entrypoint,
-	}, nil
+		// -- otherwise we'd narrow placement for a port the workload
+		// doesn't need and lose the cheapest community capacity.
+		Ports:      enginePodPorts(enginePort, dep.GetDebugShell()),
+		StartSSH:   dep.GetDebugShell(),
+		Env:        env,
+		Cmd:        cmd,
+		Entrypoint: entrypoint,
+	}
+	return req, gpuPlacements(gpuSKUs, clouds), nil
 }
 
-// agentEntrypoint returns the DockerEntrypoint override that runs the
+// agentEntrypoint returns the entrypoint override that runs the
 // registration agent alongside the engine, or nil to leave the image's own
 // entrypoint in place.
 //
@@ -334,7 +328,7 @@ func agentEntrypoint(dep *provisionerv1.Deployment, env map[string]string) []str
 	return []string{"/bin/sh", "-c", script, "iplane-engine-agent"}
 }
 
-// enginePodPorts returns the Ports list for POST /pods. Engine port is
+// enginePodPorts returns the ports list for POST /pods. Engine port is
 // always /http (proxy-routed); SSH is /tcp and only added when the
 // operator asked for debug-shell access.
 func enginePodPorts(enginePort int32, debugShell bool) []string {
@@ -398,15 +392,13 @@ func (p *Provider) waitForEngineReady(ctx context.Context, podID string, engineP
 	// signal (502 while booting -> 200 when serving) that collapses
 	// RunPod-side scheduling, the multi-GB image pull, and the engine's
 	// model download + startup into one opaque wait. To split them, each
-	// tick also reads RunPod's pod status (GET /pods/{id}) until the
-	// container has started: `machine` populated means RunPod found a
-	// host (scheduling done, now pulling the image); `lastStartedAt`
-	// populated means the container process is up (image pull done, now
-	// downloading the model + loading weights). Those map to the
-	// runpod:image-pull and engine:init phases the deployment dashboard
-	// breaks the cold start down by. The status read degrades to "keep
-	// the last known phase" on any error -- it refines observability, it
-	// never gates readiness (that's still /health alone).
+	// tick also reads RunPod's pod status until the container has
+	// started: host fields populated (machinePresent) means RunPod found
+	// a host (scheduling done, now pulling the image); a live `runtime`
+	// block means the container process is up (image pull done, now
+	// downloading the model + loading weights). The status read degrades
+	// to "keep the last known phase" on any error -- it refines
+	// observability, it never gates readiness (that's still /health alone).
 	healthURL := endpoint + "/health"
 	started := time.Now()
 	phase := phaseScheduling
@@ -446,10 +438,10 @@ func (p *Provider) waitForEngineReady(ctx context.Context, podID string, engineP
 				}
 				if tracePhases {
 					fmt.Fprintf(os.Stderr,
-						"iplane-phase-trace\tpod=%s\telapsed=%s\tphase=%s\tderived=%s\tmachine=%t\tcontainerStarted=%t\tcreatedAt=%s\tlastStartedAt=%s\tdesiredStatus=%s\thealth=%s\n",
+						"iplane-phase-trace\tpod=%s\telapsed=%s\tphase=%s\tderived=%s\tmachine=%t\tcontainerStarted=%t\tcreatedAt=%s\tstartedAt=%s\tstatus=%s\thealth=%s\n",
 						podID, elapsed, phase, refined, sig.machinePresent, sig.containerStarted,
-						emptyDash(sig.createdAt), emptyDash(sig.lastStartedAt),
-						emptyDash(sig.desiredStatus), emptyDash(statusText))
+						emptyDash(sig.createdAt), emptyDash(sig.startedAt),
+						emptyDash(sig.status), emptyDash(statusText))
 				}
 			}
 		}
@@ -517,14 +509,14 @@ func enginePhaseDescription(phase string) string {
 // podPhaseSignals is one observation of the RunPod status fields the
 // phase ladder is derived from. Carried alongside the derived phase so
 // the phase trace (EnvPhaseTrace) can print the raw inputs, not just the
-// conclusion -- the whole point of issue 208 is that the conclusion is
-// suspected wrong.
+// conclusion -- the whole point of issue 208 is that the conclusion was
+// once wrong.
 type podPhaseSignals struct {
 	machinePresent   bool
 	containerStarted bool
 	createdAt        string
-	lastStartedAt    string
-	desiredStatus    string
+	startedAt        string
+	status           string
 }
 
 // probeEnginePhase reads RunPod's pod status (GET /pods/{id}) and maps
@@ -532,58 +524,31 @@ type podPhaseSignals struct {
 // keeps the last known phase -- this refines observability and must
 // never gate readiness or fail the deploy. Best-effort: a per-read
 // timeout keeps a hung status GET from stalling the health-poll tick.
-// Two reads are needed because neither API version carries both
-// signals: v1 has the host assignment (machineId) but omits `runtime`,
-// while v2 has `runtime` (the container-start boundary). The v2 read is
-// skipped once the container is known started, and the whole prober
-// stops running once the ladder reaches engine-init, so the extra call
-// only happens during the image-pull window.
+//
+// One read carries both signals. Under v1 it took two: v1 had the host
+// assignment (machineId) but omitted `runtime`, so a second read went to
+// v2 for the container-start boundary.
 func (p *Provider) probeEnginePhase(ctx context.Context, podID string) (string, podPhaseSignals, bool) {
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	getReq, err := p.client.newReq("GET", "/pods/"+podID, nil, nil)
-	if err != nil {
-		return "", podPhaseSignals{}, false
-	}
-	pod, err := skhttp.Call[podBody](probeCtx, getReq, p.client.callOpts()...)
+	pod, err := p.getPod(probeCtx, podID)
 	if err != nil {
 		return "", podPhaseSignals{}, false
 	}
 	sig := podPhaseSignals{
-		machinePresent: pod.machinePresent(),
-		createdAt:      pod.CreatedAt,
-		lastStartedAt:  pod.LastStartedAt,
-		desiredStatus:  pod.DesiredStatus,
+		machinePresent:   pod.machinePresent(),
+		containerStarted: pod.Runtime.containerStarted(),
+		createdAt:        pod.CreatedAt,
+		startedAt:        pod.StartedAt,
+		status:           pod.Status,
 	}
-	sig.containerStarted = p.probeContainerStarted(probeCtx, podID)
 	return classifyEnginePhase(sig.machinePresent, sig.containerStarted), sig, true
 }
 
-// probeContainerStarted reports whether RunPod's v2 pod status shows a
-// live container runtime. Best-effort: any error reads as "not started
-// yet", which keeps the caller on the lower phase rung rather than
-// falsely advancing it.
-//
-// This replaces the v1 lastStartedAt test, which was stamped at pod
-// creation and so was true from the first probe (issue 208).
-func (p *Provider) probeContainerStarted(ctx context.Context, podID string) bool {
-	req, err := skhttp.NewBytesRequest("GET", p.client.v2PodURL(podID), nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Authorization", "Bearer "+p.client.apiKey)
-	req.Header.Set("Accept", "application/json")
-	body, err := skhttp.Call[podV2Body](ctx, req, p.client.callOpts()...)
-	if err != nil {
-		return false
-	}
-	return body.Runtime.containerStarted()
-}
-
 // classifyEnginePhase maps two observable RunPod signals to a cold-start
-// phase. A host assignment (v1 machineId / machine) means scheduling is
-// done and the image pull is underway; a live container runtime (v2
-// `runtime`) means the pull is done and the engine is initializing.
+// phase. A host assignment (machinePresent) means scheduling is done and
+// the image pull is underway; a live container runtime (`runtime`) means
+// the pull is done and the engine is initializing.
 //
 // Both arguments MUST be state signals, never timestamps. The phase
 // ladder was dead for its first two rungs because `containerStarted` was
@@ -624,7 +589,7 @@ func httpProbeHealth(ctx context.Context, url string) (bool, string, error) {
 	return resp.StatusCode/100 == 2, resp.Status, nil
 }
 
-// isTransientTerminateErr returns true when a DELETE /pods/{id} error
+// isTransientTerminateErr returns true when a DELETE /v2/pods/{id} error
 // is the kind that's worth retrying (network timeout, 5xx, 408, 429).
 // 4xx-other-than-404 -- and 404 is already swallowed upstream as
 // "pod already gone" -- mean the operator's input is wrong, not the
