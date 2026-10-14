@@ -117,7 +117,7 @@ func runDemo() {
 		case provisioners.ProviderRunPod:
 			// Leave empty -- the adapter will not pin dataCenterIds, so
 			// RunPod schedules wherever capacity exists for the
-			// requested gpuTypeIds. Operators who want to pin a specific
+			// requested GPU types. Operators who want to pin a specific
 			// datacenter (latency-sensitive workloads, data-residency)
 			// pass --region US-WA-1 explicitly.
 		default:
