@@ -191,6 +191,7 @@ const FORMULAS = {
           { value: 4, label: 'FP32 (4 bytes)' },
           { value: 2, label: 'FP16/BF16 (2 bytes)' },
           { value: 1, label: 'INT8 (1 byte)' },
+          { value: 0.61, label: 'Q4_K_M GGUF (~0.61 bytes)' },
           { value: 0.5, label: 'INT4 (0.5 bytes)' }
         ]
       },
@@ -213,6 +214,26 @@ const FORMULAS = {
         max: 256
       },
       {
+        id: 'l',
+        label: 'Layers',
+        type: 'number',
+        default: 0,
+        min: 0,
+        max: 256,
+        step: 1,
+        hint: 'num_hidden_layers from config.json; 0 estimates it from the parameter count'
+      },
+      {
+        id: 'h',
+        label: 'KV Heads',
+        type: 'number',
+        default: 0,
+        min: 0,
+        max: 256,
+        step: 1,
+        hint: 'num_key_value_heads from config.json; 0 estimates it'
+      },
+      {
         id: 'overhead',
         label: 'Overhead',
         type: 'select',
@@ -233,15 +254,18 @@ const FORMULAS = {
     ],
 
     calculate(inputs) {
-      const { p, q, c, n, overhead } = inputs;
+      const { p, q, c, n, l = 0, h = 0, overhead } = inputs;
 
       // Weights
       const weightsGB = (p * 1e9 * q) / 1e9;
 
-      // Estimate KV cache (simplified: assume typical architecture)
-      // Roughly: layers ≈ 2 * sqrt(params_B), heads ≈ sqrt(params_B) * 4
-      const layers = Math.round(2 * Math.sqrt(p) + 20);
-      const kvHeads = Math.max(8, Math.round(Math.sqrt(p) * 4));
+      // KV cache. Layers and KV heads come from the model's config.json when
+      // given. Otherwise they are estimated from the parameter count, which
+      // ignores grouped-query attention and overstates the cache of most
+      // current models (a 7B estimates 11 KV heads; Qwen 2.5 7B has 4).
+      const estimated = !(l > 0 && h > 0);
+      const layers = l > 0 ? Math.round(l) : Math.round(2 * Math.sqrt(p) + 20);
+      const kvHeads = h > 0 ? Math.round(h) : Math.max(8, Math.round(Math.sqrt(p) * 4));
       const headDim = 128;
       const kvBytes = q >= 1 ? 2 : 2; // KV usually FP16 even with quantized weights
       const kvCacheGB = (2 * layers * kvHeads * headDim * c * kvBytes * n) / 1e9;
@@ -257,7 +281,7 @@ const FORMULAS = {
         unit: 'GB',
         breakdown: [
           { label: 'Weights', value: `${weightsGB.toFixed(1)} GB` },
-          { label: 'KV Cache (est.)', value: `${kvCacheGB.toFixed(1)} GB` },
+          { label: estimated ? 'KV Cache (est.)' : `KV Cache (${layers} layers, ${kvHeads} KV heads)`, value: `${kvCacheGB.toFixed(2)} GB` },
           { label: 'Activations (est.)', value: `${activationsGB.toFixed(2)} GB` },
           { label: 'Subtotal', value: `${subtotal.toFixed(1)} GB` },
           { label: `+ ${((overhead - 1) * 100).toFixed(0)}% overhead`, value: `${(subtotal * (overhead - 1)).toFixed(1)} GB` },
@@ -274,7 +298,7 @@ const FORMULAS = {
     chapter: 3,
     section: '3.5.3',
     description: 'Calculate when buying hardware becomes cheaper than renting',
-    latex: '\\text{Break-even (months)} = \\frac{\\text{Hardware} + \\text{Setup}}{\\text{Rental} - \\text{Operating}}',
+    latex: '\\text{Break-even (months)} = \\frac{\\text{Hardware} + \\text{Setup}}{\\text{Rental} - (\\text{Power} + \\text{Maintenance})}',
 
     inputs: [
       {
@@ -340,6 +364,17 @@ const FORMULAS = {
         min: 50,
         max: 1000,
         step: 10
+      },
+      {
+        id: 'maint',
+        label: 'Maintenance',
+        unit: '$/month',
+        type: 'number',
+        default: 0,
+        min: 0,
+        max: 10000,
+        step: 1,
+        hint: 'Repairs, spares, cooling; Chapter 3 budgets $10'
       }
     ],
 
@@ -351,12 +386,12 @@ const FORMULAS = {
     ],
 
     calculate(inputs) {
-      const { hw, setup, rent, hours, power, watts } = inputs;
+      const { hw, setup, rent, hours, power, watts, maint = 0 } = inputs;
 
       // Monthly costs
       const monthlyRental = rent * hours;
       const monthlyPower = (watts / 1000) * hours * power;
-      const monthlyOperating = monthlyPower; // Simplified, could add cooling, maintenance
+      const monthlyOperating = monthlyPower + maint;
 
       const capitalCost = hw + setup;
       const monthlySavings = monthlyRental - monthlyOperating;
@@ -381,6 +416,7 @@ const FORMULAS = {
         breakdown: [
           { label: 'Monthly rental', value: `$${monthlyRental.toFixed(0)}` },
           { label: 'Monthly power', value: `$${monthlyPower.toFixed(0)}` },
+          { label: 'Monthly maintenance', value: `$${maint.toFixed(0)}` },
           { label: 'Monthly savings', value: `$${monthlySavings.toFixed(0)}` },
           { label: 'Capital cost', value: `$${capitalCost.toLocaleString()}` },
           { label: 'Recommendation', value: recommendation }
