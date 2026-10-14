@@ -3,225 +3,211 @@ package runpod
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-// fakeGraphQLServer captures the requests + lets each test wire its
-// own pubKey value and HTTP status. The original keyregistrar
-// hard-codes the URL to api.runpod.io/graphql; we redirect by
-// constructing the Provider with a custom http.Client whose Transport
-// rewrites Host to point at the httptest server.
-//
-// (We do not change the const graphqlEndpoint to a var; production
-// behavior should not be a moving target. The Transport rewrite is
-// test-only.)
-type fakeGraphQLServer struct {
-	server         *httptest.Server
-	currentPubKey  string
-	status         int
-	updates        []string // captures the pubKey value each updateUserSettings sets
-	requestHeaders []http.Header
+// fakeSSHKeys plays GET/PUT /v2/account/ssh-keys: it holds the account's
+// key set, answers GET with it, and replaces it wholesale on PUT the way
+// RunPod does. Every PUT body is recorded so tests can assert on exactly
+// what was written.
+type fakeSSHKeys struct {
+	keys    []string
+	status  int        // non-200 answers every request with this status
+	puts    [][]string // the keys of each PUT, in order
+	methods []string
+	rawPuts []string
 }
 
-func newFakeGraphQL(t *testing.T) *fakeGraphQLServer {
+func newFakeSSHKeys(t *testing.T, keys ...string) (*fakeSSHKeys, *Provider) {
 	t.Helper()
-	f := &fakeGraphQLServer{status: http.StatusOK}
-	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f.requestHeaders = append(f.requestHeaders, r.Header.Clone())
+	f := &fakeSSHKeys{keys: keys, status: http.StatusOK}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/account/ssh-keys" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			t.Errorf("missing bearer auth")
+		}
+		f.methods = append(f.methods, r.Method)
 		if f.status != http.StatusOK {
+			w.Header().Set("Content-Type", "application/problem+json")
 			w.WriteHeader(f.status)
-			_, _ = w.Write([]byte(`{"error":"forbidden"}`))
+			_, _ = w.Write([]byte(problem(f.status, http.StatusText(f.status), "access denied")))
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
-		var env struct {
-			Query string `json:"query"`
-		}
-		_ = json.Unmarshal(body, &env)
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.Contains(env.Query, "myself"):
-			resp := map[string]any{"data": map[string]any{"myself": map[string]any{"pubKey": f.currentPubKey}}}
-			_ = json.NewEncoder(w).Encode(resp)
-		case strings.Contains(env.Query, "updateUserSettings"):
-			// Extract pubKey arg via a forgiving substring match -- the
-			// production code formats with fmt.Sprintf `pubKey: %q `,
-			// producing `pubKey: "<escaped>" }) { id }`.
-			i := strings.Index(env.Query, `pubKey: "`)
-			start := i + len(`pubKey: "`)
-			end := strings.Index(env.Query[start:], `" })`)
-			if i >= 0 && end >= 0 {
-				raw := env.Query[start : start+end]
-				// Unescape what production %q produces.
-				raw = strings.ReplaceAll(raw, `\n`, "\n")
-				raw = strings.ReplaceAll(raw, `\"`, `"`)
-				f.updates = append(f.updates, raw)
-				f.currentPubKey = raw
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"updateUserSettings": map[string]any{"id": "user_1"}}})
+		switch r.Method {
+		case http.MethodGet:
+		case http.MethodPut:
+			var raw json.RawMessage
+			_ = json.NewDecoder(r.Body).Decode(&raw)
+			f.rawPuts = append(f.rawPuts, string(raw))
+			var body sshKeysBody
+			_ = json.Unmarshal(raw, &body)
+			f.puts = append(f.puts, body.Keys)
+			f.keys = body.Keys
 		default:
-			http.Error(w, "unexpected query", http.StatusBadRequest)
+			t.Errorf("unexpected method %s", r.Method)
 		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(sshKeysBody{Keys: f.keys})
 	}))
-	t.Cleanup(f.server.Close)
-	return f
+	t.Cleanup(srv.Close)
+	return f, New(NewClient("test-api-key", WithBaseURL(srv.URL+"/v2"), WithHTTPClient(srv.Client())))
 }
 
-// providerForTest builds a runpod.Provider whose http.Client rewrites
-// any request bound for api.runpod.io to the httptest server.
-func providerForTest(t *testing.T, f *fakeGraphQLServer) *Provider {
-	t.Helper()
-	rt := &rewriteTransport{toHost: strings.TrimPrefix(f.server.URL, "http://")}
-	httpClient := &http.Client{Transport: rt}
-	return New(NewClient("test-api-key", WithHTTPClient(httpClient)))
-}
-
-// rewriteTransport rewrites api.runpod.io -> the httptest host so
-// production keyregistrar.go's hardcoded URL still works in tests.
-type rewriteTransport struct {
-	toHost string
-}
-
-func (t *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.URL.Scheme = "http"
-	req.URL.Host = t.toHost
-	req.Host = t.toHost
-	return http.DefaultTransport.RoundTrip(req)
-}
-
-const iplaneKey1 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN1qOJSfqQS1J0CKvqg7n0X2Kvz5kZbAVfAHvKvYrPLB iplane-default-runpod-2026-05-20T15:30:00Z\n"
-const iplaneKey2 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN1qOJSfqQS1J0CKvqg7n0X2Kvz5kZbAVfAHvKvYrPLC iplane-default-runpod-2026-05-20T15:30:00Z\n"
-const userKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBQQbcAVcAVcAVcAVcAVcAVcAVcAVcAVcAVcAVcAVcA user@laptop\n"
+const iplaneKey1 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN1qOJSfqQS1J0CKvqg7n0X2Kvz5kZbAVfAHvKvYrPLB iplane-default-runpod-2026-05-20T15:30:00Z"
+const iplaneKey2 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN1qOJSfqQS1J0CKvqg7n0X2Kvz5kZbAVfAHvKvYrPLC iplane-default-runpod-2026-05-20T15:30:00Z"
+const userKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBQQbcAVcAVcAVcAVcAVcAVcAVcAVcAVcAVcAVcAVcA user@laptop"
+const iplaneComment = "iplane-default-runpod-2026-05-20T15:30:00Z"
 
 func TestEnsurePublicKey_UploadsWhenAbsent(t *testing.T) {
-	f := newFakeGraphQL(t)
-	f.currentPubKey = "" // empty account
-	p := providerForTest(t, f)
-
-	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), "iplane-default-runpod-2026-05-20T15:30:00Z"); err != nil {
+	f, p := newFakeSSHKeys(t) // empty account
+	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1+"\n"), iplaneComment); err != nil {
 		t.Fatalf("EnsurePublicKey: %v", err)
 	}
-	if len(f.updates) != 1 {
-		t.Fatalf("updateUserSettings called %d times, want 1", len(f.updates))
+	if len(f.puts) != 1 {
+		t.Fatalf("PUT called %d times, want 1", len(f.puts))
 	}
-	if !strings.Contains(f.updates[0], "iplane-default-runpod") {
-		t.Errorf("uploaded blob missing the iplane key: %q", f.updates[0])
+	// One element per key, no trailing newline: the PUT schema validates
+	// each entry as a single authorized_keys line.
+	if len(f.puts[0]) != 1 || f.puts[0][0] != iplaneKey1 {
+		t.Errorf("PUT keys = %q, want exactly [%q]", f.puts[0], iplaneKey1)
 	}
 }
 
 func TestEnsurePublicKey_SkipsWhenAlreadyPresent(t *testing.T) {
-	f := newFakeGraphQL(t)
-	f.currentPubKey = iplaneKey1 // same iplane key already there
-	p := providerForTest(t, f)
-
-	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), "iplane-default-runpod-2026-05-20T15:30:00Z"); err != nil {
+	f, p := newFakeSSHKeys(t, iplaneKey1)
+	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), iplaneComment); err != nil {
 		t.Fatalf("EnsurePublicKey: %v", err)
 	}
-	if len(f.updates) != 0 {
-		t.Errorf("updateUserSettings called %d times, want 0 (key already present)", len(f.updates))
+	if len(f.puts) != 0 {
+		t.Errorf("PUT called %d times, want 0 (key already present)", len(f.puts))
 	}
 }
 
 func TestEnsurePublicKey_PreservesOtherKeys(t *testing.T) {
-	f := newFakeGraphQL(t)
-	f.currentPubKey = userKey // user's own pre-existing key
-	p := providerForTest(t, f)
-
-	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), "iplane-default-runpod-2026-05-20T15:30:00Z"); err != nil {
+	f, p := newFakeSSHKeys(t, userKey) // user's own pre-existing key
+	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), iplaneComment); err != nil {
 		t.Fatalf("EnsurePublicKey: %v", err)
 	}
-	if len(f.updates) != 1 {
-		t.Fatalf("updateUserSettings called %d times, want 1", len(f.updates))
+	if len(f.puts) != 1 {
+		t.Fatalf("PUT called %d times, want 1", len(f.puts))
 	}
-	blob := f.updates[0]
-	if !strings.Contains(blob, "user@laptop") {
-		t.Errorf("uploaded blob dropped the user's existing key: %q", blob)
+	// PUT replaces the whole set, so dropping the user's key here would
+	// delete it from their account.
+	got := strings.Join(f.puts[0], "\n")
+	if !strings.Contains(got, "user@laptop") {
+		t.Errorf("PUT dropped the user's existing key: %q", f.puts[0])
 	}
-	if !strings.Contains(blob, "iplane-default-runpod") {
-		t.Errorf("uploaded blob missing the iplane key: %q", blob)
+	if !strings.Contains(got, iplaneComment) {
+		t.Errorf("PUT missing the iplane key: %q", f.puts[0])
 	}
 }
 
 func TestEnsurePublicKey_ReplacesStaleIplaneKey(t *testing.T) {
 	// Old iplane key with the same comment-prefix but DIFFERENT bytes
 	// (e.g. operator wiped the keystore and a new keypair was
-	// generated). EnsurePublicKey now PRUNES the stale iplane entry
-	// and writes only the current key -- prevents the blob from
-	// growing unbounded across keystore regenerations, and avoids
-	// confusing RunPod's pod-init when multiple iplane lines are
-	// present.
-	f := newFakeGraphQL(t)
-	f.currentPubKey = iplaneKey2 + userKey
-	p := providerForTest(t, f)
-
-	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), "iplane-default-runpod-2026-05-20T15:30:00Z"); err != nil {
+	// generated). EnsurePublicKey PRUNES the stale iplane entry and
+	// writes only the current key, so the set does not grow unbounded
+	// across keystore regenerations.
+	f, p := newFakeSSHKeys(t, iplaneKey2, userKey)
+	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), iplaneComment); err != nil {
 		t.Fatalf("EnsurePublicKey: %v", err)
 	}
-	if len(f.updates) != 1 {
-		t.Fatalf("updateUserSettings called %d times, want 1", len(f.updates))
+	if len(f.puts) != 1 {
+		t.Fatalf("PUT called %d times, want 1", len(f.puts))
 	}
-	written := f.updates[0]
-	if !strings.Contains(written, strings.TrimSuffix(iplaneKey1, "\n")) {
-		t.Errorf("written blob missing the current iplane key:\n%s", written)
+	written := strings.Join(f.puts[0], "\n")
+	if !strings.Contains(written, iplaneKey1) {
+		t.Errorf("written set missing the current iplane key:\n%s", written)
 	}
-	if strings.Contains(written, strings.TrimSuffix(iplaneKey2, "\n")) {
-		t.Errorf("stale iplane key was NOT pruned; blob still contains it:\n%s", written)
+	if strings.Contains(written, iplaneKey2) {
+		t.Errorf("stale iplane key was NOT pruned:\n%s", written)
 	}
-	if !strings.Contains(written, strings.TrimSuffix(userKey, "\n")) {
-		t.Errorf("operator's own key was NOT preserved; blob:\n%s", written)
-	}
-}
-
-func TestEnsurePublicKey_NoOp_WhenCurrentKeyAlone(t *testing.T) {
-	// The blob is already exactly our current iplane key and nothing
-	// else. EnsurePublicKey must not write -- avoids hammering RunPod
-	// on every CreateInstance.
-	f := newFakeGraphQL(t)
-	f.currentPubKey = iplaneKey1
-	p := providerForTest(t, f)
-
-	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), "iplane-default-runpod-2026-05-20T15:30:00Z"); err != nil {
-		t.Fatalf("EnsurePublicKey: %v", err)
-	}
-	if len(f.updates) != 0 {
-		t.Errorf("expected zero updates; got %d", len(f.updates))
+	if !strings.Contains(written, userKey) {
+		t.Errorf("operator's own key was NOT preserved:\n%s", written)
 	}
 }
 
 func TestEnsurePublicKey_PrunesEvenWhenCurrentKeyAlreadyPresent(t *testing.T) {
-	// Current key IS in the blob, but a stale iplane entry is also
-	// there (e.g. the blob accumulated across earlier keystores).
-	// EnsurePublicKey should still rewrite to prune the stale one.
-	f := newFakeGraphQL(t)
-	f.currentPubKey = iplaneKey2 + iplaneKey1 + userKey
-	p := providerForTest(t, f)
-
-	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), "iplane-default-runpod-2026-05-20T15:30:00Z"); err != nil {
+	// Current key IS registered, but a stale iplane entry is too (the set
+	// accumulated across earlier keystores). EnsurePublicKey should still
+	// rewrite to prune the stale one.
+	f, p := newFakeSSHKeys(t, iplaneKey2, iplaneKey1, userKey)
+	if err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), iplaneComment); err != nil {
 		t.Fatalf("EnsurePublicKey: %v", err)
 	}
-	if len(f.updates) != 1 {
-		t.Fatalf("expected 1 update to prune stale entries; got %d", len(f.updates))
+	if len(f.puts) != 1 {
+		t.Fatalf("expected 1 PUT to prune stale entries; got %d", len(f.puts))
 	}
-	written := f.updates[0]
-	if strings.Contains(written, strings.TrimSuffix(iplaneKey2, "\n")) {
-		t.Errorf("stale iplane key was NOT pruned:\n%s", written)
+	if got := strings.Join(f.puts[0], "\n"); strings.Contains(got, iplaneKey2) {
+		t.Errorf("stale iplane key was NOT pruned:\n%s", got)
+	}
+	if len(f.puts[0]) != 2 {
+		t.Errorf("PUT keys = %q, want the current iplane key and the user's", f.puts[0])
 	}
 }
 
-func TestEnsurePublicKey_403SurfacesScopedKeyMessage(t *testing.T) {
-	f := newFakeGraphQL(t)
-	f.status = http.StatusForbidden
-	p := providerForTest(t, f)
+// A GET, a PUT, then a GET has to read back what was written, and the PUT
+// body is exactly {"keys": [...]}: UpdateSshKeysRequest is a closed schema.
+func TestSSHKeys_RoundTrip(t *testing.T) {
+	f, p := newFakeSSHKeys(t, userKey)
+	ctx := context.Background()
 
-	err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), "iplane-default-runpod-2026-05-20T15:30:00Z")
+	if err := p.EnsurePublicKey(ctx, []byte(iplaneKey1), iplaneComment); err != nil {
+		t.Fatalf("EnsurePublicKey: %v", err)
+	}
+	if strings.Join(f.methods, ",") != "GET,PUT" {
+		t.Errorf("methods = %v, want GET then PUT", f.methods)
+	}
+	var put map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(f.rawPuts[0]), &put); err != nil || len(put) != 1 || put["keys"] == nil {
+		t.Errorf("PUT body = %s, want exactly {\"keys\": [...]}", f.rawPuts[0])
+	}
+
+	blob, err := p.FetchUserPubKey(ctx)
+	if err != nil {
+		t.Fatalf("FetchUserPubKey: %v", err)
+	}
+	if blob != userKey+"\n"+iplaneKey1+"\n" {
+		t.Errorf("read back %q, want the user's key then the iplane key, one per line", blob)
+	}
+
+	// And the next ensure is a no-op against what the PUT left.
+	if err := p.EnsurePublicKey(ctx, []byte(iplaneKey1), iplaneComment); err != nil {
+		t.Fatalf("second EnsurePublicKey: %v", err)
+	}
+	if len(f.puts) != 1 {
+		t.Errorf("PUTs = %d after a second ensure, want still 1", len(f.puts))
+	}
+}
+
+func TestFetchUserPubKey_EmptyAccount(t *testing.T) {
+	_, p := newFakeSSHKeys(t)
+	blob, err := p.FetchUserPubKey(context.Background())
+	if err != nil {
+		t.Fatalf("FetchUserPubKey: %v", err)
+	}
+	if blob != "" {
+		t.Errorf("blob = %q, want empty for an account with no keys", blob)
+	}
+}
+
+func TestEnsurePublicKey_403NamesTheScope(t *testing.T) {
+	f, p := newFakeSSHKeys(t)
+	f.status = http.StatusForbidden
+
+	err := p.EnsurePublicKey(context.Background(), []byte(iplaneKey1), iplaneComment)
 	if err == nil {
 		t.Fatal("expected error on 403")
 	}
-	if !strings.Contains(err.Error(), "Full scope") {
-		t.Errorf("error message %q should mention the Full-scope requirement", err)
+	if !strings.Contains(err.Error(), "authentication:read") {
+		t.Errorf("error %q should name the scope the key lacks", err)
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("error %q lost RunPod's detail", err)
 	}
 }
