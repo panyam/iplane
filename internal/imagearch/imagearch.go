@@ -15,9 +15,9 @@
 //
 // An older tag is a single manifest with no platform block anywhere. The
 // architecture lives in the *config blob* the manifest points at, which is a
-// second request. vLLM's v0.7.0 is this shape, and it is the tag this repo
-// names in most of its examples, so the two-hop path is the normal path
-// rather than a legacy branch.
+// second request. vLLM's v0.7.x tags are this shape, and they still turn up
+// in older configs and in the chNN-final tags of earlier chapters, so the
+// two-hop path is a real path rather than dead code.
 //
 // # Auth is read from the challenge, not hardcoded
 //

@@ -69,7 +69,7 @@ func runDeploymentModels(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Example:")
 	fmt.Fprintln(out, "  iplane deployment deploy my-llama --instance my-pod \\")
-	fmt.Fprintln(out, "    --image vllm/vllm-openai:v0.7.0 \\")
+	fmt.Fprintln(out, "    --image vllm/vllm-openai:v0.27.1 \\")
 	fmt.Fprintln(out, "    --model Qwen/Qwen2.5-1.5B-Instruct")
 	return nil
 }
