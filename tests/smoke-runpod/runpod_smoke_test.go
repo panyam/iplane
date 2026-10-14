@@ -8,7 +8,8 @@
 // Run:
 //
 //	export RUNPOD_API_KEY=...
-//	make smoke-runpod
+//	make smoke-runpod     # rents + terminates a pod (~$0.05)
+//	make runpod-v2-check  # read-only, free (readonly_test.go)
 //
 // The dedicated build tag (smoke_runpod, not plain smoke) keeps this
 // out of every other test target so an operator running `make smoke`

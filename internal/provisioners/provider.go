@@ -97,8 +97,9 @@ type Provider interface {
 // EnsurePublicKey is expected to be idempotent: when the provider
 // already has this exact public key on file (matched by comment via
 // IsIplaneComment + exact-bytes check), the implementation should
-// be a no-op. RunPod's pubKey blob is a read-modify-write surface,
-// so the runpod adapter does both checks.
+// be a no-op. RunPod's account key set is replaced whole on every
+// write (PUT /v2/account/ssh-keys), so the runpod adapter does both
+// checks.
 //
 // Errors abort CreateInstance with FailedPrecondition; no Spawn
 // happens. This is the cost-gate behavior the design doc commits

@@ -69,7 +69,7 @@ flatten to underscore (so `deployment.provider` → `IPLANE_DEPLOYMENT_PROVIDER`
 | `IPLANE_RUNPOD_DEBUG`              | `1` logs RunPod HTTP request/response bytes (sans Authorization) to stderr |
 | `IPLANE_DEPLOYMENT_PROVIDER` / `_GPU_TYPE` / `_BILLING_MODE` / `_INSTANCE_ID` | Cost-metric labels |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`      | OTLP collector address                   |
-| `RUNPOD_API_KEY`                   | Required for `iplane instance create runpod ...` — must be a new-style scoped key (`rpa_...` prefix) with **Full** access (REST scope is NOT covered by legacy keys or `api.runpod.ai`-only scopes — both silently 401 on `rest.runpod.io/v1`) |
+| `RUNPOD_API_KEY`                   | Required for `iplane instance create runpod ...`. The adapter speaks only REST v2 (`api.runpod.io/v2`) since 2026-10; a scoped key needs `pods:read/write` and `authentication:read/write` (SSH keys), and Full access covers both. `make runpod-v2-check` verifies a key read-only |
 
 Future provider API keys (not used in v0.1): `LAMBDA_API_KEY`, `VAST_API_KEY`, `EQUINIX_AUTH_TOKEN`, `EQUINIX_PROJECT_ID`. See `.env.local.example`.
 
