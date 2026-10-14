@@ -107,7 +107,7 @@ func typeToCandidate(name string, it *instanceTypeBlock, region string) *provisi
 		exactBytes = skucatalog.ExactVRAMBytes(spec.VRAMGb)
 	}
 
-	res := fabric.Resolve(fabric.Observation{Family: family})
+	res := fabric.Resolve(fabric.Observation{Family: family, GpuCount: int32(it.Specs.GPUs)})
 	return &provisioners.Candidate{
 		// No HostID and no OfferID on purpose. Lambda rents a shape in a
 		// region, not a particular machine, so there is nothing stable to

@@ -87,7 +87,7 @@ func (p *Provider) Deploy(ctx context.Context, dep *provisionerv1.Deployment, in
 	gpuTypeIDs := candidateSKUs(reqs)
 	if len(gpuTypeIDs) == 0 {
 		return deployFailed(emit, "vast:find-offer", fmt.Errorf(
-			"no vast SKU satisfies the requirements (min_vram_gb=%d)", reqs.GetMinVramGb()))
+			"no vast SKU satisfies the requirements (min_vram_gb=%d)%s", reqs.GetMinVramGb(), splitHint(reqs)))
 	}
 	offer, skuName, err := p.findAnyOffer(ctx, gpuTypeIDs, gpuCount, diskGB, reqs)
 	if err != nil {

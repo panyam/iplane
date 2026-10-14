@@ -259,7 +259,7 @@ func candidateRows(g gpuCatalogEntry, cloud string, price float64, gpuCount int,
 		family = spec.Family
 		exactBytes = skucatalog.ExactVRAMBytes(spec.VRAMGb)
 	}
-	res := fabric.Resolve(fabric.Observation{Family: family})
+	res := fabric.Resolve(fabric.Observation{Family: family, GpuCount: int32(gpuCount)})
 
 	// Unavailable datacenters are dropped rather than recorded as "here
 	// but empty", since a candidate an operator cannot act on is the
