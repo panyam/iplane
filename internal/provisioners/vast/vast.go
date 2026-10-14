@@ -314,8 +314,8 @@ func (p *Provider) Spawn(ctx context.Context, spec *provisionerv1.Spec) (*provis
 		gpuTypeIDs = candidateSKUs(reqs)
 		if len(gpuTypeIDs) == 0 {
 			return nil, provisioners.NewProviderError(p.Name(), "spawn",
-				fmt.Errorf("no SKU in the vast catalog satisfies min_vram_gb=%d min_ram_gb=%d",
-					reqs.GetMinVramGb(), reqs.GetMinRamGb()), 0)
+				fmt.Errorf("no SKU in the vast catalog satisfies min_vram_gb=%d min_ram_gb=%d%s",
+					reqs.GetMinVramGb(), reqs.GetMinRamGb(), splitHint(reqs)), 0)
 		}
 		resolvedSKU = gpuTypeIDs[0]
 		if resolvedClass == "" {
@@ -551,7 +551,7 @@ func offerVRAMFloorMB(gpuName string, reqs *provisionerv1.ResourceRequirements) 
 	// bound the top.
 	//
 	// Measured on 2026-08-21, floors against what the card reports:
-	// A100 74000/81920, H200 130425/143771, B200 177600/183359,
+	// A100 74000/81920, H200 130425/143771, B200 166393/183359,
 	// B300 266400/275040. The nearest tier below an 80 GB card reports
 	// 40960, so the slack never blurs two tiers.
 	const mibPerDecimalGB = 953 // 1e9 / (1 << 20)
