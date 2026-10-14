@@ -116,7 +116,10 @@ var skus = []SKUSpec{
 	// XL (>=94 GB VRAM): frontier / multi-tenant.
 	{GpuName: "H100_NVL", DisplayName: "H100 NVL", VRAMGb: 94, DefaultSystemRAMGb: 192, PriceUSDPerHour: 2.30, Family: fabric.FamilyH100NVL},
 	{GpuName: "H200", DisplayName: "H200", VRAMGb: 141, DefaultSystemRAMGb: 256, PriceUSDPerHour: 3.20, Family: fabric.FamilyH200SXM},
-	{GpuName: "B200", DisplayName: "B200", VRAMGb: 192, DefaultSystemRAMGb: 256, PriceUSDPerHour: 4.80, Family: fabric.FamilyB200},
+	// 180, not 192: the card reports 183359 MiB (179 GiB, or 192 decimal
+	// GB), and NVIDIA's shipping spec and Lambda both say 180. Matches the
+	// RunPod and Lambda rows, so one card reads the same on every provider.
+	{GpuName: "B200", DisplayName: "B200", VRAMGb: 180, DefaultSystemRAMGb: 256, PriceUSDPerHour: 4.80, Family: fabric.FamilyB200},
 	// 288 GB per card, so eight of them hold 2304 GB. That is the
 	// single-node route to a model that otherwise needs a cross-node pool:
 	// Kimi K3 is 1560 GB at four bits and fits eight of nothing smaller.
@@ -262,4 +265,10 @@ func (p *Provider) CardCapacityBytes(sku string) int64 {
 		return 0
 	}
 	return skucatalog.ExactVRAMBytes(spec.VRAMGb)
+}
+
+// splitHint names the families an intra-node request refused because their
+// fabric does not join that many cards, as a suffix for a no-match error.
+func splitHint(reqs *provisionerv1.ResourceRequirements) string {
+	return skucatalog.SplitHint(catalogEntries(), reqs)
 }

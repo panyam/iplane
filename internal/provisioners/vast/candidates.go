@@ -85,7 +85,7 @@ func offerToCandidate(sku string, o *offerSummary, reclaim provisionerv1.Reclaim
 	// built from and it is tolerant on purpose; capacity wants the other
 	// error direction (#323).
 	var exactBytes int64
-	obs := fabric.Observation{}
+	obs := fabric.Observation{GpuCount: int32(o.NumGPUs)}
 	if spec := LookupSKU(sku); spec != nil {
 		obs.Family = spec.Family
 		exactBytes = skucatalog.ExactVRAMBytes(spec.VRAMGb)

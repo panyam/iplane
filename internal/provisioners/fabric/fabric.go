@@ -13,6 +13,8 @@
 package fabric
 
 import (
+	"fmt"
+
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
 )
 
@@ -86,6 +88,11 @@ type Spec struct {
 	// BIDIRECTIONAL per-GPU figure times 8 (an A100 SXM's published 600 GB/s
 	// is 4800 here). 0 when the family has no fabric.
 	PeakGbps int32
+	// DomainSize is the most cards one fabric on this family joins, so a
+	// group wider than it is islands rather than one fabric. 8 for an
+	// NVSwitch or xGMI board, 2 for a bridge, which joins pairs. 0 when the
+	// family has no fabric.
+	DomainSize int32
 }
 
 // catalog is the declared tier: what each family is capable of, independent
@@ -102,50 +109,57 @@ type Spec struct {
 // for H100 SXM (bidirectional). So min_fabric_gbps is dependable for
 // separating fabric tiers and not for fine thresholds near a card's rating.
 var catalog = map[Family]Spec{
-	// Board-integrated fabric. No configuration lacks it.
-	FamilyA100SXM: {CapabilityAlways, "nvlink", 4800},
-	FamilyH100SXM: {CapabilityAlways, "nvswitch", 7200},
-	FamilyH200SXM: {CapabilityAlways, "nvswitch", 7200},
-	FamilyB200:    {CapabilityAlways, "nvswitch", 14400},
-	FamilyB300:    {CapabilityAlways, "nvswitch", 14400},
-	FamilyV100SXM: {CapabilityAlways, "nvlink", 2400},
+	// Board-integrated fabric. No configuration lacks it, and one NVSwitch
+	// (or, on an A100 HGX, a direct mesh) joins all eight cards. The V100
+	// SXM board is a hybrid cube-mesh rather than all-to-all, but its eight
+	// cards share one NVLink domain that NCCL rings run across.
+	FamilyA100SXM: {CapabilityAlways, "nvlink", 4800, 8},
+	FamilyH100SXM: {CapabilityAlways, "nvswitch", 7200, 8},
+	FamilyH200SXM: {CapabilityAlways, "nvswitch", 7200, 8},
+	FamilyB200:    {CapabilityAlways, "nvswitch", 14400, 8},
+	FamilyB300:    {CapabilityAlways, "nvswitch", 14400, 8},
+	FamilyV100SXM: {CapabilityAlways, "nvlink", 2400, 8},
 	// MI300X's fabric is xGMI, not NVLink. It is INTRA_NODE all the same,
 	// and it is the case a vendor-named enum could never have expressed.
-	FamilyMI300X: {CapabilityAlways, "xgmi", 8192},
+	FamilyMI300X: {CapabilityAlways, "xgmi", 8192, 8},
 
-	// GH200 superchips carry NVLink between GPUs. Note the catalog describes
+	// GH200 superchips carry NVLink between GPUs, two per node at most (NVL2). Note the catalog describes
 	// the CARD, not the rented shape: Lambda only sells gpu_1x_gh200, where
 	// there is no second card to link to. Requiring a fabric on a one-GPU
 	// instance is rejected up front (see the service-layer validation) rather
 	// than resolved here.
-	FamilyGH200: {CapabilityAlways, "nvlink", 7200},
+	FamilyGH200: {CapabilityAlways, "nvlink", 7200, 2},
 
-	// NVL parts are bridged pairs from the factory.
-	FamilyH100NVL: {CapabilityAlways, "nvlink", 4800},
-	FamilyH200NVL: {CapabilityAlways, "nvlink", 4800},
+	// NVL parts are bridged pairs from the factory, so four of them are two
+	// islands of two (Ch 10, Fig 10.9). The H200 NVL also ships with a 4-way
+	// bridge, but nothing a provider publishes says which one a host has, so
+	// past a pair it is not vouched for and fails closed.
+	FamilyH100NVL: {CapabilityAlways, "nvlink", 4800, 2},
+	FamilyH200NVL: {CapabilityAlways, "nvlink", 4800, 2},
 
 	// Bridge-capable: the card supports NVLink, the host may not have
 	// installed it, and the provider does not say. Probing Vast live,
 	// 3 of 24 "A100 PCIE" offers reported 275-300 GB/s, so treating these
-	// as NONE would wrongly exclude real working machines.
-	FamilyA100PCIe: {CapabilityOptional, "nvlink", 4800},
-	FamilyH100PCIe: {CapabilityOptional, "nvlink", 4800},
-	FamilyA6000:    {CapabilityOptional, "nvlink", 896},
+	// as NONE would wrongly exclude real working machines. Their bridges
+	// join two cards, so a reading can vouch for a pair and never for more.
+	FamilyA100PCIe: {CapabilityOptional, "nvlink", 4800, 2},
+	FamilyH100PCIe: {CapabilityOptional, "nvlink", 4800, 2},
+	FamilyA6000:    {CapabilityOptional, "nvlink", 896, 2},
 	// The 3090 is the one consumer card with an NVLink connector; the 4090
 	// and 5090 dropped it. Bridge-capable, so a Vast reading can rescue it.
-	FamilyRTX3090: {CapabilityOptional, "nvlink", 896},
-	FamilyA5000:   {CapabilityOptional, "nvlink", 896},
+	FamilyRTX3090: {CapabilityOptional, "nvlink", 896, 2},
+	FamilyA5000:   {CapabilityOptional, "nvlink", 896, 2},
 
 	// No intra-node fabric at all. A zero reading on these is a fact.
-	FamilyA10:        {CapabilityNone, "", 0},
-	FamilyL40S:       {CapabilityNone, "", 0},
-	FamilyL40:        {CapabilityNone, "", 0},
-	FamilyL4:         {CapabilityNone, "", 0},
-	FamilyA40:        {CapabilityNone, "", 0},
-	FamilyRTX6000Ada: {CapabilityNone, "", 0},
-	FamilyRTX4090:    {CapabilityNone, "", 0},
-	FamilyRTX5090:    {CapabilityNone, "", 0},
-	FamilyV100PCIe:   {CapabilityNone, "", 0},
+	FamilyA10:        {CapabilityNone, "", 0, 0},
+	FamilyL40S:       {CapabilityNone, "", 0, 0},
+	FamilyL40:        {CapabilityNone, "", 0, 0},
+	FamilyL4:         {CapabilityNone, "", 0, 0},
+	FamilyA40:        {CapabilityNone, "", 0, 0},
+	FamilyRTX6000Ada: {CapabilityNone, "", 0, 0},
+	FamilyRTX4090:    {CapabilityNone, "", 0, 0},
+	FamilyRTX5090:    {CapabilityNone, "", 0, 0},
+	FamilyV100PCIe:   {CapabilityNone, "", 0, 0},
 }
 
 // Observation is what an adapter learned about one candidate: which family
@@ -164,6 +178,12 @@ type Observation struct {
 	// rather than trusted, which is what Resolve does.
 	MeasuredGbps   int32
 	HasMeasurement bool
+
+	// GpuCount is how many cards the group spans. An intra-node fabric has to
+	// join all of them, so a count wider than the family's DomainSize splits
+	// the verdict (see Resolve). 0 means not stated, and the verdict is about
+	// the card alone, which is what every caller got before counts were read.
+	GpuCount int32
 }
 
 // Result is the resolved fabric of a candidate, ready to be stamped onto
@@ -173,6 +193,12 @@ type Result struct {
 	Source     provisionerv1.FabricSource
 	Gbps       int32
 	Technology string
+
+	// Split is set, with the reason, when the cards carry a fabric that does
+	// not join all of them: two bridged pairs on a four-card host. Scope is
+	// then UNSPECIFIED, so the group satisfies neither INTRA_NODE (no one
+	// fabric spans it) nor NONE (its pairs are linked).
+	Split string
 }
 
 // Resolve turns a catalog entry plus an optional provider reading into a
@@ -187,10 +213,44 @@ type Result struct {
 //  3. A real measurement outranks the catalog, since a bridged card named
 //     "PCIe" is a machine a name-only catalog would wrongly exclude.
 //
+// A fourth rule sits over all three: a fabric only counts for the group if it
+// joins every card in it. When obs.GpuCount exceeds the family's DomainSize,
+// a verdict that would have been INTRA_NODE comes back split instead.
+//
 // Resolve never reports INTER_NODE: no provider we have exposes a cross-node
 // fabric on a single rented instance. That scope arrives with the group
 // provisioning capability (issue 212).
 func Resolve(obs Observation) Result {
+	res := resolveCard(obs)
+	if res.Scope != provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE {
+		return res
+	}
+	if reason := SplitReason(obs.Family, obs.GpuCount); reason != "" {
+		return Result{
+			Scope:      provisionerv1.FabricScope_FABRIC_SCOPE_UNSPECIFIED,
+			Source:     res.Source,
+			Technology: res.Technology,
+			Split:      reason,
+		}
+	}
+	return res
+}
+
+// SplitReason says why a group of gpuCount cards of this family is not one
+// fabric, or returns "" when it is, when the family has no fabric at all, or
+// when the count is not stated.
+func SplitReason(family Family, gpuCount int32) string {
+	spec, known := catalog[family]
+	if !known || spec.DomainSize <= 0 || gpuCount <= spec.DomainSize {
+		return ""
+	}
+	return fmt.Sprintf("%s fabric joins at most %d cards, so %d cards would be islands rather than one intra-node fabric",
+		family, spec.DomainSize, gpuCount)
+}
+
+// resolveCard is the verdict about the card, before the group's width is
+// considered.
+func resolveCard(obs Observation) Result {
 	spec, known := catalog[obs.Family]
 	if !known {
 		return Result{
@@ -281,9 +341,14 @@ func Satisfies(got Result, wantScope provisionerv1.FabricScope, minGbps int32) b
 // real 275-300 GB/s link. So the catalog filters only what is IMPOSSIBLE, and
 // the provider query settles what is merely uncertain.
 //
+// The group's width is the exception to deferring to a reading: a bridge joins
+// a pair however well it measures, so a family whose DomainSize is below
+// gpuCount is impossible for INTRA_NODE and is dropped here. 0 means not
+// stated.
+//
 // Callers must still run Satisfies on the resolved result. CouldSatisfy
 // narrows a search; it never admits anything.
-func CouldSatisfy(family Family, wantScope provisionerv1.FabricScope) bool {
+func CouldSatisfy(family Family, wantScope provisionerv1.FabricScope, gpuCount int32) bool {
 	if wantScope == provisionerv1.FabricScope_FABRIC_SCOPE_UNSPECIFIED {
 		return true
 	}
@@ -296,7 +361,7 @@ func CouldSatisfy(family Family, wantScope provisionerv1.FabricScope) bool {
 		return spec.Capability == CapabilityNone
 	case provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE:
 		// Always AND Optional: the second is the one a reading can rescue.
-		return spec.Capability != CapabilityNone
+		return spec.Capability != CapabilityNone && SplitReason(family, gpuCount) == ""
 	default:
 		// INTER_NODE is not derivable from a single instance's card.
 		return false
@@ -312,6 +377,9 @@ func CouldSatisfy(family Family, wantScope provisionerv1.FabricScope) bool {
 func Stamp(hw *provisionerv1.Hardware, obs Observation) {
 	if hw == nil {
 		return
+	}
+	if obs.GpuCount == 0 {
+		obs.GpuCount = hw.GetGpuCount()
 	}
 	res := Resolve(obs)
 	hw.FabricScope = res.Scope

@@ -168,8 +168,8 @@ func (p *Provider) Spawn(ctx context.Context, spec *provisionerv1.Spec) (*provis
 		ids := MatchSKUs(reqs)
 		if len(ids) == 0 {
 			return nil, provisioners.NewProviderError(p.Name(), "spawn",
-				fmt.Errorf("no SKU in the lambdalabs catalog satisfies min_vram_gb=%d gpu_count=%d",
-					reqs.GetMinVramGb(), reqs.GetGpuCount()), 0)
+				fmt.Errorf("no SKU in the lambdalabs catalog satisfies min_vram_gb=%d gpu_count=%d%s",
+					reqs.GetMinVramGb(), reqs.GetGpuCount(), splitHint(reqs)), 0)
 		}
 		instanceTypeName = ids[0]
 		if resolvedClass == "" {

@@ -172,7 +172,7 @@ func TestCatalogEntriesAreConsistent(t *testing.T) {
 func TestCouldSatisfyIsPermissiveWhereSatisfiesIsNot(t *testing.T) {
 	const bridgeCapable = FamilyA100PCIe
 
-	if !CouldSatisfy(bridgeCapable, scopeIntra) {
+	if !CouldSatisfy(bridgeCapable, scopeIntra, 0) {
 		t.Error("bridge-capable card excluded from an intra-node SEARCH; a reading could still rescue it")
 	}
 	if Satisfies(Resolve(Observation{Family: bridgeCapable}), scopeIntra, 0) {
@@ -198,7 +198,7 @@ func TestCouldSatisfy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := CouldSatisfy(tt.family, tt.want); got != tt.ok {
+			if got := CouldSatisfy(tt.family, tt.want, 0); got != tt.ok {
 				t.Errorf("CouldSatisfy(%q, %v) = %v, want %v", tt.family, tt.want, got, tt.ok)
 			}
 		})

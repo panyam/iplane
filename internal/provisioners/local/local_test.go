@@ -153,3 +153,49 @@ func TestProvider_Spawn_VRAMConstraintExceedsLaptop(t *testing.T) {
 
 // Compile-time check the test fixtures still satisfy the interface.
 var _ provisioners.Provider = (*Provider)(nil)
+
+// The laptop has the cards it has. Asking for eight used to succeed on a
+// one-GPU machine because only VRAM was checked.
+func TestProvider_Spawn_RejectsMoreCardsThanDetected(t *testing.T) {
+	p := New()
+	p.detected = gpuDetection{class: provisioners.GPUClassSmall, sku: "RTX 4090", count: 1, vramGB: 24}
+	spec := newSpec()
+	spec.Requirements = &provisionerv1.ResourceRequirements{GpuCount: 8}
+	_, err := p.Spawn(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "gpu_count") {
+		t.Fatalf("Spawn(gpu_count=8) on a one-GPU host: err %v, want a gpu_count rejection", err)
+	}
+
+	spec.Requirements = &provisionerv1.ResourceRequirements{GpuCount: 1}
+	if _, err := p.Spawn(context.Background(), spec); err != nil {
+		t.Errorf("Spawn(gpu_count=1) on a one-GPU host: %v", err)
+	}
+}
+
+// The local provider reports no fabric, so a stated fabric requirement fails
+// closed, the same rule every other provider follows for an unknown fabric.
+func TestProvider_Spawn_RejectsAFabricItCannotReport(t *testing.T) {
+	p := New()
+	p.detected = gpuDetection{class: provisioners.GPUClassSmall, sku: "RTX 4090", count: 1, vramGB: 24}
+	spec := newSpec()
+	spec.Requirements = &provisionerv1.ResourceRequirements{
+		GpuCount:    1,
+		FabricScope: provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE,
+	}
+	_, err := p.Spawn(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "fabric") {
+		t.Fatalf("Spawn(fabric=intra-node) on local: err %v, want a fabric rejection", err)
+	}
+}
+
+// A machine with no GPU still runs the CPU path at one "card", which is what
+// CI and the mock engine rely on.
+func TestProvider_Spawn_CPUOnlyHostStillTakesOne(t *testing.T) {
+	p := New()
+	p.detected = gpuDetection{class: provisioners.GPUClassSmall, sku: "cpu-only"}
+	spec := newSpec()
+	spec.Requirements = &provisionerv1.ResourceRequirements{GpuCount: 1}
+	if _, err := p.Spawn(context.Background(), spec); err != nil {
+		t.Errorf("Spawn(gpu_count=1) on a cpu-only host: %v", err)
+	}
+}

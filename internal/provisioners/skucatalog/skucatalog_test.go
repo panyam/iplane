@@ -1,6 +1,8 @@
 package skucatalog
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	provisionerv1 "github.com/inference-book/inference-plane/gen/go/provisioner/v1"
@@ -227,5 +229,43 @@ func TestPerCardRAMStillRejectsAtOneCard(t *testing.T) {
 
 	if got := Match(catalog, &provisionerv1.ResourceRequirements{GpuCount: 1, MinRamGb: 200}, FabricDeclared); len(got) != 0 {
 		t.Errorf("got %v, want nothing: one 96 GB card cannot satisfy a 200 GB instance", got)
+	}
+}
+
+// Fig 10.9's case at the catalog: four cards on a family whose fabric joins
+// pairs is two islands, and intra-node has to mean one fabric for all four.
+func TestIntraNodeRefusesAFamilyWhoseDomainIsSmallerThanTheGroup(t *testing.T) {
+	entries := []Entry{
+		{Token: "nvl-pair", VRAMGb: 94, PriceUSDPerHour: 2.99, Family: fabric.FamilyH100NVL},
+		{Token: "sxm-board", VRAMGb: 80, PriceUSDPerHour: 3.49, Family: fabric.FamilyH100SXM},
+		{Token: "pcie-bridgeable", VRAMGb: 80, PriceUSDPerHour: 1.20, Family: fabric.FamilyA100PCIe},
+	}
+	intra := func(n int32) *provisionerv1.ResourceRequirements {
+		return &provisionerv1.ResourceRequirements{
+			GpuCount:    n,
+			FabricScope: provisionerv1.FabricScope_FABRIC_SCOPE_INTRA_NODE,
+		}
+	}
+
+	if got := Match(entries, intra(4), FabricDeclared); !slices.Equal(got, []string{"sxm-board"}) {
+		t.Errorf("declared, 4 cards: got %v, want [sxm-board]", got)
+	}
+	if got := Match(entries, intra(2), FabricDeclared); !slices.Equal(got, []string{"nvl-pair", "sxm-board"}) {
+		t.Errorf("declared, 2 cards: got %v, want [nvl-pair sxm-board]", got)
+	}
+	if got := Match(entries, intra(8), FabricDeclared); !slices.Equal(got, []string{"sxm-board"}) {
+		t.Errorf("declared, 8 cards: got %v, want [sxm-board]", got)
+	}
+	// A reading cannot rescue a four-card bridged box, so the prefilter drops it too.
+	if got := Match(entries, intra(4), FabricPrefilter); !slices.Equal(got, []string{"sxm-board"}) {
+		t.Errorf("prefilter, 4 cards: got %v, want [sxm-board]", got)
+	}
+
+	reason := SplitReason(entries, intra(4))
+	if !strings.Contains(reason, "h100-nvl") || !strings.Contains(reason, "a100-pcie") {
+		t.Errorf("split reason %q should name both families it refused", reason)
+	}
+	if r := SplitReason(entries, intra(2)); r != "" {
+		t.Errorf("2 cards: split reason %q, want none", r)
 	}
 }

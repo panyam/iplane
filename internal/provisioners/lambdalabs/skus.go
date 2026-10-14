@@ -224,3 +224,9 @@ func (p *Provider) CardCapacityBytes(sku string) int64 {
 	}
 	return skucatalog.ExactVRAMBytes(spec.VRAMGb)
 }
+
+// splitHint names the families an intra-node request refused because their
+// fabric does not join that many cards, as a suffix for a no-match error.
+func splitHint(reqs *provisionerv1.ResourceRequirements) string {
+	return skucatalog.SplitHint(catalogEntries(), reqs)
+}
