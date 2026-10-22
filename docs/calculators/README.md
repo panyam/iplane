@@ -1,6 +1,6 @@
 # Interactive Calculators
 
-The seven calculators that Chapters 2 and 3 of *Inference Is All You Need* link to
+The seven calculators that Chapters 2 and 3 of *Self-Hosted LLM Inference* link to
 by QR code. Live at <https://panyam.github.io/iplane/>.
 
 They do their arithmetic in the browser and need nothing behind them but a file

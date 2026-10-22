@@ -26,15 +26,14 @@ func BasePath() string {
 	return os.Getenv("CALC_BASE_PATH")
 }
 
-// BookTitle is the one place the book's title is written on this site. It is
-// still provisional: the publisher has "Self-Hosted LLM Inference" on record and
-// the author has asked to keep this one as the main title. When that is settled,
-// change it here (or set BOOK_TITLE) and republish; nothing else names the book.
+// BookTitle is the one place the book's title is written on this site. To
+// change it, edit it here (or set BOOK_TITLE) and republish; nothing else names
+// the book.
 func BookTitle() string {
 	if t := os.Getenv("BOOK_TITLE"); t != "" {
 		return t
 	}
-	return "Inference Is All You Need"
+	return "Self-Hosted LLM Inference"
 }
 
 var site = s3.Site{
@@ -83,7 +82,7 @@ func main() {
 		Handler: withLogger(router),
 		Addr:    *addr,
 	}
-	log.Printf("'Inference is all you need' Book Calculators serving on %s", *addr)
+	log.Printf("Book calculators serving on %s", *addr)
 	log.Fatal(srv.ListenAndServe())
 }
 
