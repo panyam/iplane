@@ -1,7 +1,8 @@
 # inference-plane
 
 Reference implementation of the Control Plane built throughout
-*Inference Is All You Need: A Systems Engineer's Guide* (Apress, 2026).
+*Self-Hosted LLM Inference: Building and Operating Production AI Systems
+from Single GPU to Multi-GPU Clusters* (Apress, 2026).
 
 This repo and the book are paired in the **Tanenbaum / MINIX** style
 — the book teaches principles with readable code that shows the
