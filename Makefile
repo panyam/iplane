@@ -143,13 +143,37 @@ check-pins: ## Verify pinned-versions.env matches the book's pinned-versions.tex
 gen-names: ## Regenerate names.go and metric-names.tex from metric-names.yaml
 	go run ./cmd/iplane gen-names
 
+# The two generated files live in different repos, so each is checked against the
+# repo it belongs to.  Handing git one pathspec inside this worktree and one
+# outside it drops git out of "filter this diff" mode and makes it compare the two
+# files directly, which always differs.  The book is a sibling checkout and may be
+# absent (fresh clone, no book alongside); then its half cannot be verified here.
+BOOK_DIR  := ../book
+NAMES_GO  := internal/telemetry/names.go
+NAMES_TEX := src/styles/metric-names.tex
+NULL      := /dev/null
+
 check-names: ## Verify generated name files are up-to-date with the YAML schema (CI runs this)
-	@go run ./cmd/iplane gen-names
-	@if ! git diff --quiet -- internal/telemetry/names.go ../book/src/styles/metric-names.tex; then \
-		echo "ERROR: generated name files are out of sync with metric-names.yaml."; \
+	@if [ -d $(BOOK_DIR)/.git ]; then \
+		go run ./cmd/iplane gen-names; \
+	else \
+		go run ./cmd/iplane gen-names --tex-out $(NULL); \
+	fi
+	@if ! git diff --quiet -- $(NAMES_GO); then \
+		echo "ERROR: $(NAMES_GO) is out of sync with metric-names.yaml."; \
 		echo "Run 'make gen-names' and commit the result."; \
-		git diff --stat -- internal/telemetry/names.go ../book/src/styles/metric-names.tex; \
+		git diff --stat -- $(NAMES_GO); \
 		exit 1; \
+	fi
+	@if [ -d $(BOOK_DIR)/.git ]; then \
+		if ! git -C $(BOOK_DIR) diff --quiet -- $(NAMES_TEX); then \
+			echo "ERROR: the book's $(NAMES_TEX) is out of sync with metric-names.yaml."; \
+			echo "Run 'make gen-names' here, then commit the result in the book repo."; \
+			git -C $(BOOK_DIR) diff --stat -- $(NAMES_TEX); \
+			exit 1; \
+		fi; \
+	else \
+		echo "note: $(BOOK_DIR) is not checked out; the book's LaTeX output was not verified."; \
 	fi
 	@echo "name files in sync with metric-names.yaml"
 
